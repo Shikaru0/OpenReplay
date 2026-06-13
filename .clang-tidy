@@ -1,0 +1,23 @@
+---
+Checks: >
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  performance-*,
+  modernize-*,
+  bugprone-*,
+  readability-*,
+  -readability-identifier-length,
+  -modernize-use-trailing-return-type,
+  -readability-function-cognitive-complexity
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*'
+FormatStyle: file
+CheckOptions:
+  - key: performance-move-const-arg.CheckTriviallyCopyableMove
+    value: '1'
+  - key: modernize-loop-convert.MinConfidence
+    value: reasonable
+  - key: bugprone-sizeof-expression.WarnOnSizeOfConstant
+    value: '1'
+...
