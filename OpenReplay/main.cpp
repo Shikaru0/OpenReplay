@@ -770,11 +770,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int show) {
     loadCfg();
     loadProfiles();
 
-    if (g_config.enableVideo) {
-        g_config.captureWidth = GetSystemMetrics(SM_CXSCREEN);
-        g_config.captureHeight = GetSystemMetrics(SM_CYSCREEN);
-    }
-
     {
         OpenReplay::OpenReplayEngine engine;
         g_engine = &engine;

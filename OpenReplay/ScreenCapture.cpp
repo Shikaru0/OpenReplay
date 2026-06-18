@@ -11,41 +11,86 @@ namespace OpenReplay {
 
 constexpr DWORD kAcquireTimeoutMs = 1;
 
+static int g_monitorCount = 0;
+static std::string g_monitorNames[8];
+static LUID g_adapterLuids[8];
+static UINT g_adapterOutputIdx[8];
+
+struct WinMon {
+    std::wstring deviceName;
+    RECT rect;
+};
+
+struct EnumMonCtx { std::vector<WinMon>* out; };
+
+static BOOL CALLBACK enumMonCB(HMONITOR hMon, HDC, LPRECT, LPARAM lParam) {
+    auto* ctx = (EnumMonCtx*)lParam;
+    MONITORINFOEXW mi;
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hMon, &mi)) {
+        ctx->out->push_back({ mi.szDevice, mi.rcMonitor });
+    }
+    return TRUE;
+}
+
 bool ScreenCapture::init(int monitorIdx) {
     if (m_initialized) return true;
+    m_monitorIdx = monitorIdx;
 
-    if (!initD3D11()) {
-        std::cerr << "[ScreenCapture] D3D11 init failed\n";
-        shutdown();
+    if (enumerateMonitors() == 0) return false;
+    if (monitorIdx < 0 || monitorIdx >= g_monitorCount) return false;
+
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+
+    LUID targetLuid = g_adapterLuids[monitorIdx];
+    UINT targetOutputIdx = g_adapterOutputIdx[monitorIdx];
+
+    IDXGIAdapter* targetAdapter = nullptr;
+    {
+        IDXGIAdapter* adapter = nullptr;
+        for (UINT ai = 0; factory->EnumAdapters(ai, &adapter) != DXGI_ERROR_NOT_FOUND; ++ai) {
+            DXGI_ADAPTER_DESC adesc;
+            if (SUCCEEDED(adapter->GetDesc(&adesc)) &&
+                std::memcmp(&adesc.AdapterLuid, &targetLuid, sizeof(LUID)) == 0) {
+                targetAdapter = adapter;
+                targetAdapter->AddRef();
+                adapter->Release();
+                break;
+            }
+            adapter->Release();
+        }
+    }
+    factory->Release();
+    if (!targetAdapter) return false;
+
+    D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0
+    };
+
+    HRESULT hr = D3D11CreateDevice(targetAdapter, D3D_DRIVER_TYPE_UNKNOWN,
+                                    nullptr, 0, levels, 2,
+                                    D3D11_SDK_VERSION, &m_d3dDevice,
+                                    &m_featureLevel, &m_d3dCtx);
+    if (FAILED(hr) || !m_d3dDevice || !m_d3dCtx) {
+        targetAdapter->Release();
         return false;
     }
 
-    HRESULT hr;
-
-    IDXGIDevice* dxgiDevice = nullptr;
-    hr = m_d3dDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
-    if (FAILED(hr)) { shutdown(); return false; }
-
-    IDXGIAdapter* adapter = nullptr;
-    hr = dxgiDevice->GetParent(IID_PPV_ARGS(&adapter));
-    dxgiDevice->Release();
-    if (FAILED(hr)) { shutdown(); return false; }
-
     IDXGIOutput* output = nullptr;
-    hr = adapter->EnumOutputs(monitorIdx, &output);
-    if (FAILED(hr)) { adapter->Release(); shutdown(); return false; }
-
-    DXGI_OUTPUT_DESC outputDesc;
-    output->GetDesc(&outputDesc);
+    hr = targetAdapter->EnumOutputs(targetOutputIdx, &output);
+    targetAdapter->Release();
+    if (FAILED(hr)) { shutdown(); return false; }
 
     IDXGIOutput1* output1 = nullptr;
     hr = output->QueryInterface(IID_PPV_ARGS(&output1));
     output->Release();
-    if (FAILED(hr)) { adapter->Release(); shutdown(); return false; }
+    if (FAILED(hr)) { shutdown(); return false; }
 
     hr = output1->DuplicateOutput(m_d3dDevice, &m_duplication);
     output1->Release();
-    if (FAILED(hr)) { adapter->Release(); shutdown(); return false; }
+    if (FAILED(hr)) { shutdown(); return false; }
 
     DXGI_OUTDUPL_DESC dupDesc;
     m_duplication->GetDesc(&dupDesc);
@@ -66,9 +111,8 @@ bool ScreenCapture::init(int monitorIdx) {
     stagingDesc.Format = m_format;
 
     hr = m_d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &m_staging);
-    if (FAILED(hr)) { adapter->Release(); shutdown(); return false; }
+    if (FAILED(hr)) { shutdown(); return false; }
 
-    adapter->Release();
     m_initialized = true;
     return true;
 }
@@ -81,78 +125,58 @@ void ScreenCapture::shutdown() {
     if (m_d3dDevice) { m_d3dDevice->Release(); m_d3dDevice = nullptr; }
 }
 
-bool ScreenCapture::initD3D11() {
-    HRESULT hr;
-
-    IDXGIFactory1* factory = nullptr;
-    hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
-    if (FAILED(hr)) return false;
-
-    size_t bestMemory = 0;
-    IDXGIAdapter* bestAdapter = nullptr;
-    IDXGIAdapter* adapter = nullptr;
-
-    for (UINT i = 0; factory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC desc;
-        if (SUCCEEDED(adapter->GetDesc(&desc))) {
-            if (desc.VendorId == 0x1414) {
-                adapter->Release();
-                continue;
-            }
-            if (desc.DedicatedVideoMemory > bestMemory) {
-                bestMemory = desc.DedicatedVideoMemory;
-                if (bestAdapter) bestAdapter->Release();
-                bestAdapter = adapter;
-                adapter->AddRef();
-            }
-        }
-        adapter->Release();
-    }
-
-    factory->Release();
-    if (!bestAdapter) return false;
-
-    D3D_FEATURE_LEVEL levels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0
-    };
-
-    UINT flags = 0;
-    hr = D3D11CreateDevice(bestAdapter, D3D_DRIVER_TYPE_UNKNOWN,
-                           nullptr, flags, levels, 2,
-                           D3D11_SDK_VERSION, &m_d3dDevice,
-                           &m_featureLevel, &m_d3dCtx);
-    bestAdapter->Release();
-    if (FAILED(hr) || !m_d3dDevice || !m_d3dCtx) return false;
-    return true;
-}
-
-static int g_monitorCount = 0;
-static std::string g_monitorNames[8];
-
 int ScreenCapture::enumerateMonitors() {
     if (g_monitorCount > 0) return g_monitorCount;
+
+    std::vector<WinMon> winMons;
+    EnumMonCtx ctx{ &winMons };
+    EnumDisplayMonitors(nullptr, nullptr, enumMonCB, (LPARAM)&ctx);
+
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 0;
-    IDXGIAdapter* adapter = nullptr;
+
     g_monitorCount = 0;
-    for (UINT ai = 0; factory->EnumAdapters(ai, &adapter) != DXGI_ERROR_NOT_FOUND; ++ai) {
-        IDXGIOutput* output = nullptr;
-        for (UINT oi = 0; adapter->EnumOutputs(oi, &output) != DXGI_ERROR_NOT_FOUND; ++oi) {
-            DXGI_OUTPUT_DESC od;
-            if (SUCCEEDED(output->GetDesc(&od)) && g_monitorCount < 8) {
-                int w = WideCharToMultiByte(CP_UTF8, 0, od.DeviceName, -1, nullptr, 0, nullptr, nullptr);
-                if (w > 0) {
-                    g_monitorNames[g_monitorCount].resize(w);
-                    WideCharToMultiByte(CP_UTF8, 0, od.DeviceName, -1,
-                                        g_monitorNames[g_monitorCount].data(), w, nullptr, nullptr);
+
+    for (auto& wm : winMons) {
+        if (g_monitorCount >= 8) break;
+        IDXGIAdapter* adapter = nullptr;
+        for (UINT ai = 0; factory->EnumAdapters(ai, &adapter) != DXGI_ERROR_NOT_FOUND; ++ai) {
+            DXGI_ADAPTER_DESC adesc;
+            adapter->GetDesc(&adesc);
+
+            IDXGIOutput* output = nullptr;
+            for (UINT oi = 0; adapter->EnumOutputs(oi, &output) != DXGI_ERROR_NOT_FOUND; ++oi) {
+                DXGI_OUTPUT_DESC od;
+                if (SUCCEEDED(output->GetDesc(&od))) {
+                    size_t winLen = wm.deviceName.length();
+                    if (wcsncmp(wm.deviceName.c_str(), od.DeviceName, winLen) == 0) {
+                        char buf[256];
+                        int cw = WideCharToMultiByte(CP_UTF8, 0, wm.deviceName.c_str(), -1, buf, 256, nullptr, nullptr);
+                        if (cw > 0) {
+                            char label[384];
+                            snprintf(label, sizeof(label), "%s (%dx%d)",
+                                     buf,
+                                     wm.rect.right - wm.rect.left,
+                                     wm.rect.bottom - wm.rect.top);
+                            g_monitorNames[g_monitorCount] = label;
+                        } else {
+                            g_monitorNames[g_monitorCount] = "Monitor " + std::to_string(g_monitorCount);
+                        }
+                        g_adapterLuids[g_monitorCount] = adesc.AdapterLuid;
+                        g_adapterOutputIdx[g_monitorCount] = oi;
+                        g_monitorCount++;
+                        output->Release();
+                        adapter->Release();
+                        goto nextMon;
+                    }
                 }
-                g_monitorCount++;
+                output->Release();
             }
-            output->Release();
+            adapter->Release();
         }
-        adapter->Release();
+nextMon:;
     }
+
     factory->Release();
     return g_monitorCount;
 }
@@ -189,7 +213,7 @@ bool ScreenCapture::captureFrame(std::vector<uint8_t>& outPixels, int& outW, int
     if (!m_initialized) {
         if (!m_reinitFailed) {
             std::cerr << "[ScreenCapture] Not initialized, attempting re-init\n";
-            if (!init(0)) {
+            if (!init(m_monitorIdx)) {
                 m_reinitFailed = true;
             }
         }

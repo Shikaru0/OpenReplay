@@ -35,24 +35,6 @@ bool OpenReplayEngine::init(const RecorderConfig& config) {
         return false;
     }
 
-    if (config.enableVideo) {
-        m_videoEncoder = std::make_unique<VideoEncoder>();
-        m_videoEncoder->setPacketCallback(
-            [this](const uint8_t* d, uint32_t s, int64_t p, bool k) {
-                onEncodedPacket(d, s, p, k);
-            });
-
-        if (!m_videoEncoder->init(config.captureWidth, config.captureHeight,
-                                   config.maxFPS, config.videoBitrate,
-                                   config.keyframeIntervalSec,
-                                   config.encoderPreset.c_str(),
-                                   config.vbvBufferMs,
-                                   config.enablePreAnalysis)) {
-            std::cerr << "[Engine] Failed to init video encoder\n";
-            return false;
-        }
-    }
-
     if (config.enableAudio) {
         auto deviceIds = config.audioDeviceIds;
         if (deviceIds.empty()) deviceIds.push_back("");
@@ -91,6 +73,22 @@ bool OpenReplayEngine::init(const RecorderConfig& config) {
             std::lock_guard<std::mutex> lock(m_configMtx);
             m_config.captureWidth = m_screenCapture->width();
             m_config.captureHeight = m_screenCapture->height();
+        }
+
+        m_videoEncoder = std::make_unique<VideoEncoder>();
+        m_videoEncoder->setPacketCallback(
+            [this](const uint8_t* d, uint32_t s, int64_t p, bool k) {
+                onEncodedPacket(d, s, p, k);
+            });
+
+        if (!m_videoEncoder->init(m_screenCapture->width(), m_screenCapture->height(),
+                                   config.maxFPS, config.videoBitrate,
+                                   config.keyframeIntervalSec,
+                                   config.encoderPreset.c_str(),
+                                   config.vbvBufferMs,
+                                   config.enablePreAnalysis)) {
+            std::cerr << "[Engine] Failed to init video encoder\n";
+            return false;
         }
     }
 

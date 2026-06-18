@@ -35,7 +35,7 @@ public:
     static int getMonitorCount();
 
 private:
-    bool initD3D11();
+    int m_monitorIdx = 0;
 
     ID3D11Device* m_d3dDevice = nullptr;
     ID3D11DeviceContext* m_d3dCtx = nullptr;
