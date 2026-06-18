@@ -13,7 +13,6 @@
 #include <memory>
 #include <string>
 #include <mutex>
-#include <deque>
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
@@ -85,7 +84,7 @@ private:
 
     std::unique_ptr<DiskBackedBuffer> m_diskBuffer;
     std::unique_ptr<VideoEncoder> m_videoEncoder;
-    std::unique_ptr<AudioCapture> m_audioCapture;
+    std::vector<std::unique_ptr<AudioCapture>> m_audioCaptures;
     std::unique_ptr<AudioCapture> m_micCapture;
     std::unique_ptr<ScreenCapture> m_screenCapture;
     std::unique_ptr<Muxer> m_muxer;

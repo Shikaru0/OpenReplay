@@ -33,7 +33,7 @@ struct RecorderConfig {
     std::string encoderPreset = "ultralowlatency";
     int captureMonitor = 0;
     std::string rtmpUrl;
-    std::string audioDeviceId;
+    std::vector<std::string> audioDeviceIds;
     std::string micDeviceId;
 };
 

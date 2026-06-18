@@ -3,6 +3,12 @@
 #include <cstring>
 #include <algorithm>
 
+#ifdef _DEBUG
+#define LOG_DBG std::cerr
+#else
+#define LOG_DBG if (false) std::cerr
+#endif
+
 extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/mathematics.h>
@@ -233,7 +239,7 @@ static bool setupMuxContext(const char* outputPath, OutputFormat format,
     AVCodecID audioCodecId = AV_CODEC_ID_NONE;
     if (doAudioEncode) {
         audioCodecId = selectAudioCodec(format, audioCodecPref);
-        std::cerr << "[Muxer] selected audio codec: " << audioCodecId << "\n";
+        LOG_DBG << "[Muxer] selected audio codec: " << audioCodecId << "\n";
         if (audioCodecId == AV_CODEC_ID_NONE) {
             doAudioEncode = false;
         }
@@ -319,9 +325,9 @@ static bool encodeAndWriteAudio(
     int64_t bitRate, int64_t ptsOffset,
     AVCodecContext* existingEnc = nullptr)
 {
-    std::cerr << "[Muxer] encodeAndWriteAudio: packets=" << audioPackets.size()
-              << " sr=" << sampleRate << " ch=" << channels << " bps=" << bitsPerSample
-              << " codec=" << targetCodecId << " fmt=" << targetSampleFmt << "\n";
+    LOG_DBG << "[Muxer] encodeAndWriteAudio: packets=" << audioPackets.size()
+            << " sr=" << sampleRate << " ch=" << channels << " bps=" << bitsPerSample
+            << " codec=" << targetCodecId << " fmt=" << targetSampleFmt << "\n";
     AVCodecContext* actx = existingEnc;
     bool ownCtx = false;
     AVChannelLayout chLayout;
@@ -349,7 +355,7 @@ static bool encodeAndWriteAudio(
             avcodec_free_context(&actx);
             return false;
         }
-        std::cerr << "[Muxer] audio encoder opened: frame_size=" << actx->frame_size << "\n";
+        LOG_DBG << "[Muxer] audio encoder opened: frame_size=" << actx->frame_size << "\n";
     }
 
     AVSampleFormat srcFmt = pcmSampleFmt(bitsPerSample);
@@ -431,11 +437,11 @@ static bool encodeAndWriteAudio(
             inputBuf.erase(inputBuf.begin(), inputBuf.begin() + srcFrameBytes);
             pktCount++;
             if (pktCount % 50 == 0)
-                std::cerr << "[Muxer] encode: wrote " << pktCount << " audio frames\n";
+                LOG_DBG << "[Muxer] encode: wrote " << pktCount << " audio frames\n";
         }
         if (hadError) break;
     }
-    std::cerr << "[Muxer] encode: finished main loop, hadError=" << hadError << " pktCount=" << pktCount << " inputBuf=" << inputBuf.size() << "\n";
+    LOG_DBG << "[Muxer] encode: finished main loop, hadError=" << hadError << " pktCount=" << pktCount << " inputBuf=" << inputBuf.size() << "\n";
 
     if (!inputBuf.empty() && !hadError) {
         inputBuf.resize(srcFrameBytes, 0);
@@ -493,10 +499,10 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
 {
     bool hasVideo = isVideoFormat(format);
     bool hasAudio = !audioStreams.empty();
-    std::cerr << "[Muxer] muxStreaming: path=" << outputPath << " format=" << (int)format
-              << " hasVideo=" << hasVideo << " hasAudio=" << hasAudio
-              << " audioStreams=" << audioStreams.size()
-              << " endPts=" << endPts << " durationUs=" << durationUs << "\n";
+    LOG_DBG << "[Muxer] muxStreaming: path=" << outputPath << " format=" << (int)format
+            << " hasVideo=" << hasVideo << " hasAudio=" << hasAudio
+            << " audioStreams=" << audioStreams.size()
+            << " endPts=" << endPts << " durationUs=" << durationUs << "\n";
 
     if (!hasVideo && !hasAudio) return false;
 
@@ -505,8 +511,8 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
     ms.hasAudio = hasAudio;
 
     size_t totalPkts = buffer->getPacketCount();
-    std::cerr << "[Muxer] totalPkts=" << totalPkts << "\n";
-    if (totalPkts == 0) { std::cerr << "[Muxer] no packets\n"; freeMuxStreams(ms); return false; }
+    LOG_DBG << "[Muxer] totalPkts=" << totalPkts << "\n";
+    if (totalPkts == 0) { LOG_DBG << "[Muxer] no packets\n"; freeMuxStreams(ms); return false; }
 
     size_t totalVideo = 0, totalAudio = 0;
     int64_t ptsOffset = INT64_MAX;
@@ -577,8 +583,8 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
 
     for (auto& as : ms.audioStates) {
         if (!as.doEncode) continue;
-        std::cerr << "[Muxer] preparing audio encode for type=" << (int)as.info.packetType
-                  << " title=" << (as.info.title ? as.info.title : "?") << "\n";
+        LOG_DBG << "[Muxer] preparing audio encode for type=" << (int)as.info.packetType
+                << " title=" << (as.info.title ? as.info.title : "?") << "\n";
         std::vector<RetrievedPacket> audioPkts;
         for (auto& ref : refs) {
             if (ref.isVideo || ref.pts < rangeStart || ref.pts > endPts) continue;
@@ -591,9 +597,9 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
             if (buffer->readPacketData(ref.idx, d.data()))
                 audioPkts.push_back({std::move(d), p, pt});
         }
-        std::cerr << "[Muxer] collected " << audioPkts.size() << " audio packets for encoding\n";
+        LOG_DBG << "[Muxer] collected " << audioPkts.size() << " audio packets for encoding\n";
         if (!audioPkts.empty()) {
-            std::cerr << "[Muxer] calling encodeAndWriteAudio...\n";
+            LOG_DBG << "[Muxer] calling encodeAndWriteAudio...\n";
             if (encodeAndWriteAudio(ms.fmtCtx, as.stream, audioPkts,
                 as.info.sampleRate, as.info.channels, as.info.bitsPerSample,
                 as.codecId, codecTargetFmt(as.codecId),

@@ -4,7 +4,7 @@
 #   or auto-download: -DAUTO_DOWNLOAD_FFMPEG=ON
 
 set(FFMPEG_DIR "" CACHE PATH "Path to FFmpeg dev SDK (include/, lib/)")
-set(AUTO_DOWNLOAD_FFMPEG OFF CACHE BOOL "Auto-download FFmpeg SDK if not found")
+set(AUTO_DOWNLOAD_FFMPEG ON CACHE BOOL "Auto-download FFmpeg SDK if not found")
 
 if(NOT FFMPEG_DIR)
     find_package(FFmpeg QUIET)

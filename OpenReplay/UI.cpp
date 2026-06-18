@@ -114,6 +114,16 @@ void refreshProfileCombo() {
 
 #ifdef HAS_IMGUI
 
+void saveCfg();
+
+static bool streamToUrlSeh() {
+    __try {
+        return streamToUrl();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 static void applyQualityPreset(const char* name) {
     OpenReplay::applyQualityPreset(g_config, name);
 }
@@ -158,14 +168,13 @@ static void drawRecordingTab() {
         g_saveSuccess.store(false);
         if (g_saveThread.joinable()) g_saveThread.join();
         g_saveThread = std::thread([]() {
-            bool ok = false;
-            __try {
-                ok = streamToUrl();
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                g_threadResultMsg = "Stream failed: unexpected error";
+            bool ok = streamToUrlSeh();
+            {
+                std::lock_guard<std::mutex> lock(g_resultMutex);
+                if (!ok) g_threadResultMsg = "Stream failed: unexpected error";
+                g_lastSaveResult = g_threadResultMsg;
             }
             g_saving.store(false);
-            g_lastSaveResult = g_threadResultMsg.c_str();
             PostMessageA(g_hwnd, WM_APP_SAVE_DONE, (WPARAM)ok, 0);
         });
     }
@@ -186,10 +195,14 @@ static void drawRecordingTab() {
         ImGui::TextDisabled("%s: %s%c", tr("Save"), modStr(g_hotkeySaveMod).c_str(), g_hotkeySaveKey);
         ImGui::TextDisabled("%s: %s%c", tr("Rec"), modStr(g_hotkeyToggleMod).c_str(), g_hotkeyToggleKey);
         ImGui::TextDisabled("%s: %s%c", tr("Panel"), modStr(g_hotkeyPanelMod).c_str(), g_hotkeyPanelKey);
+        ImGui::TextDisabled("%s: %s%c", tr("Screenshot"), modStr(g_hotkeyScreenshotMod).c_str(), g_hotkeyScreenshotKey);
     }
 
-    if (!g_lastSaveResult.empty()) {
-        ImGui::Text("%s", g_lastSaveResult.c_str());
+    {
+        std::lock_guard<std::mutex> lock(g_resultMutex);
+        if (!g_lastSaveResult.empty()) {
+            ImGui::Text("%s", g_lastSaveResult.c_str());
+        }
     }
 
     if (rec && g_engine) {
@@ -247,14 +260,23 @@ static void drawCustomizeTab() {
         float cw = ImGui::GetContentRegionAvail().x - 160;
 
         ImGui::Separator(); ImGui::Text("%s", tr("QUALITY"));
-        ImGui::RadioButton(tr("Lossless"), &g_qualityPreset, 0); ImGui::SameLine();
-        ImGui::RadioButton(tr("High"), &g_qualityPreset, 1); ImGui::SameLine();
-        ImGui::RadioButton(tr("Standard"), &g_qualityPreset, 2); ImGui::SameLine();
-        ImGui::RadioButton(tr("Stream"), &g_qualityPreset, 3);
-        if (g_qualityPreset != g_prevQualityPreset) {
-            g_prevQualityPreset = g_qualityPreset;
+        {
             const char* names[] = {"lossless", "high", "standard", "stream"};
-            applyQualityPreset(names[g_qualityPreset]);
+            const char* rawLabels[] = {"Lossless", "High", "Standard", "Stream"};
+            for (int i = 0; i < 4; i++) {
+                if (i > 0) ImGui::SameLine();
+                if (ImGui::RadioButton(tr(rawLabels[i]), &g_qualityPreset, i)) {
+                    applyQualityPreset(names[i]);
+                    saveCfg();
+                }
+            }
+        }
+        {
+            const char* info[] = {"Lossless (0 Kbps, highquality, 1s keyframe)", 
+                                  "High (50000 Kbps, highquality, 2s keyframe)",
+                                  "Standard (25000 Kbps, ultralowlatency, 2s keyframe)", 
+                                  "Stream (8000 Kbps, ultralowlatency, 2s keyframe)"};
+            ImGui::TextDisabled("%s", info[g_qualityPreset]);
         }
 
         ImGui::Separator(); ImGui::Text("%s", tr("VIDEO"));
@@ -368,34 +390,51 @@ static void drawCustomizeTab() {
             g_rtmpUrl = rtmpUrlBuf;
 
         ImGui::Separator(); ImGui::Text("%s", tr("MONITOR"));
-        ImGui::SetNextItemWidth(cw);
         int monCount = OpenReplay::ScreenCapture::enumerateMonitors();
-        if (g_config.captureMonitor >= monCount) g_config.captureMonitor = 0;
-        {
-            std::vector<std::string> monNames;
+        if (monCount == 0) {
+            ImGui::TextDisabled("No monitors detected");
+        } else {
+            std::vector<std::string> monLabels;
+            std::vector<const char*> monPtrs;
             for (int i = 0; i < monCount; i++) {
                 const char* mn = OpenReplay::ScreenCapture::getMonitorName(i);
-                monNames.push_back(mn ? mn : ("Monitor " + std::to_string(i)));
+                monLabels.push_back(mn ? mn : ("Monitor " + std::to_string(i)));
+                monPtrs.push_back(monLabels.back().c_str());
             }
-            if (monNames.empty()) monNames.push_back("Default");
-            std::vector<const char*> monPtrs;
-            for (auto& n : monNames) monPtrs.push_back(n.c_str());
-            ImGui::Combo(tr("Capture"), &g_config.captureMonitor, monPtrs.data(), (int)monPtrs.size());
+            int monSel = std::min(g_config.captureMonitor, monCount - 1);
+            ImGui::SetNextItemWidth(cw);
+            if (ImGui::Combo(tr("Monitor"), &monSel, monPtrs.data(), (int)monPtrs.size())) {
+                g_config.captureMonitor = monSel;
+            }
         }
 
         ImGui::Checkbox(tr("Capture cursor"), &g_config.captureCursor);
 
         ImGui::Separator(); ImGui::Text("%s", tr("AUDIO DEVICES"));
         {
-            std::vector<const char*> audioPtrs = {"Default"};
-            for (auto& d : g_audioDevices) audioPtrs.push_back(d.name.c_str());
-            int audioSel = 0;
-            for (size_t i = 0; i < g_audioDevices.size(); i++)
-                if (g_audioDevices[i].id == g_config.audioDeviceId) { audioSel = (int)i + 1; break; }
-            ImGui::SetNextItemWidth(cw);
-            if (ImGui::Combo(tr("Loopback"), &audioSel, audioPtrs.data(), (int)audioPtrs.size())) {
-                g_config.audioDeviceId = audioSel > 0 ? g_audioDevices[audioSel - 1].id : "";
+            ImGui::Text("  %s", tr("Loopback"));
+            ImGui::Indent();
+            ImGui::PushID("loopback_devices");
+            bool changed = false;
+            for (auto& d : g_audioDevices) {
+                bool sel = false;
+                for (auto& id : g_config.audioDeviceIds)
+                    if (id == d.id) { sel = true; break; }
+                if (ImGui::Checkbox(d.name.c_str(), &sel)) {
+                    if (sel)
+                        g_config.audioDeviceIds.push_back(d.id);
+                    else
+                        g_config.audioDeviceIds.erase(
+                            std::remove(g_config.audioDeviceIds.begin(), g_config.audioDeviceIds.end(), d.id),
+                            g_config.audioDeviceIds.end());
+                    changed = true;
+                }
             }
+            ImGui::PopID();
+            if (g_config.audioDeviceIds.empty()) {
+                ImGui::TextDisabled("(%s)", tr("Default"));
+            }
+            ImGui::Unindent();
         }
         {
             std::vector<const char*> micPtrs = {"Default"};
@@ -549,14 +588,34 @@ static void drawCustomizeTab() {
         hotkeyRow(tr("Panel"), 3, g_hotkeyPanelMod, g_hotkeyPanelKey);
         hotkeyRow(tr("Screenshot"), 4, g_hotkeyScreenshotMod, g_hotkeyScreenshotKey);
         ImGui::Spacing();
+        ImGui::Separator(); ImGui::PushID("screenshot");
         ImGui::Text("%s", tr("Screenshot"));
-        ImGui::SetNextItemWidth(cw);
-        static const char* fmtNames[] = {"PNG", "JPEG"};
-        ImGui::Combo(tr("Format"), &g_screenshotFormat, fmtNames, 2);
+        {
+            int monitorIdx = g_screenshotMonitor + 1;
+            std::vector<const char*> monitorItems;
+            monitorItems.push_back("All Monitors");
+            for (auto& n : g_monitorNames)
+                monitorItems.push_back(n.c_str());
+            if (monitorIdx >= (int)monitorItems.size()) monitorIdx = 0;
+            ImGui::SetNextItemWidth(cw);
+            if (ImGui::Combo(tr("Monitor"), &monitorIdx, monitorItems.data(), (int)monitorItems.size()))
+                g_screenshotMonitor = monitorIdx - 1;
+        }
+        {
+            static const char* resItems[] = { "Source", "3840x2160", "2560x1440", "1920x1080", "1280x720" };
+            ImGui::SetNextItemWidth(cw);
+            ImGui::Combo(tr("Resolution"), &g_screenshotResolution, resItems, 5);
+        }
+        {
+            static const char* fmtNames[] = {"PNG", "JPEG"};
+            ImGui::SetNextItemWidth(cw);
+            ImGui::Combo(tr("Format"), &g_screenshotFormat, fmtNames, 2);
+        }
         if (g_screenshotFormat == 1) {
             ImGui::SetNextItemWidth(cw);
             ImGui::SliderInt(tr("Quality"), &g_screenshotQuality, 1, 100);
         }
+        ImGui::PopID();
     }
     ImGui::EndChild();
 }
@@ -571,10 +630,8 @@ void renderUI() {
 
     ImGuiWindowFlags mainFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings;
-
-    if (g_panelActive)
-        mainFlags |= ImGuiWindowFlags_NoScrollbar;
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoScrollbar;
 
     ImGui::Begin("Main", nullptr, mainFlags);
 
@@ -629,11 +686,9 @@ void renderUI() {
         float avail = ImGui::GetContentRegionAvail().y;
         if (avail > 100) ImGui::Dummy(ImVec2(0, avail - 90));
 
-        char hkBuf[128];
-        snprintf(hkBuf, sizeof(hkBuf), "%s%c  %s%c",
-                 modStr(g_hotkeySaveMod).c_str(), (char)g_hotkeySaveKey,
-                 modStr(g_hotkeyToggleMod).c_str(), (char)g_hotkeyToggleKey);
-        ImGui::TextDisabled("%s", hkBuf);
+        ImGui::TextDisabled("%s%c", modStr(g_hotkeySaveMod).c_str(), (char)g_hotkeySaveKey);
+        ImGui::TextDisabled("%s%c", modStr(g_hotkeyToggleMod).c_str(), (char)g_hotkeyToggleKey);
+        ImGui::TextDisabled("%s%c", modStr(g_hotkeyScreenshotMod).c_str(), (char)g_hotkeyScreenshotKey);
         ImGui::Separator();
 
         if (ImGui::Button(tr("Full Settings"), ImVec2(-1, bh))) {

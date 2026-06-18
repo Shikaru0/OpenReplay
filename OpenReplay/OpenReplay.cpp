@@ -54,14 +54,17 @@ bool OpenReplayEngine::init(const RecorderConfig& config) {
     }
 
     if (config.enableAudio) {
-        m_audioCapture = std::make_unique<AudioCapture>();
-        m_audioCapture->setAudioCallback(
-            [this](const uint8_t* d, uint32_t s, int64_t p) {
-                onAudioData(d, s, p);
-            });
-
-        if (!m_audioCapture->init(AudioCapture::Loopback, config.audioDeviceId)) {
-            m_audioCapture.reset();
+        auto deviceIds = config.audioDeviceIds;
+        if (deviceIds.empty()) deviceIds.push_back("");
+        for (auto& devId : deviceIds) {
+            auto cap = std::make_unique<AudioCapture>();
+            cap->setAudioCallback(
+                [this](const uint8_t* d, uint32_t s, int64_t p) {
+                    onAudioData(d, s, p);
+                });
+            if (cap->init(AudioCapture::Loopback, devId)) {
+                m_audioCaptures.push_back(std::move(cap));
+            }
         }
     }
 
@@ -79,11 +82,16 @@ bool OpenReplayEngine::init(const RecorderConfig& config) {
 
     if (config.enableVideo) {
         m_screenCapture = std::make_unique<ScreenCapture>();
-        if (!m_screenCapture->init()) {
+        if (!m_screenCapture->init(config.captureMonitor)) {
             std::cerr << "[Engine] ScreenCapture init failed\n";
             return false;
         }
         m_stats.isHdr.store(m_screenCapture->isHdr());
+        {
+            std::lock_guard<std::mutex> lock(m_configMtx);
+            m_config.captureWidth = m_screenCapture->width();
+            m_config.captureHeight = m_screenCapture->height();
+        }
     }
 
     m_muxer = std::make_unique<Muxer>();
@@ -113,8 +121,8 @@ void OpenReplayEngine::startCapture() {
         uint64_t bufBytes = m_config.bufferSizeMB * 1024ULL * 1024;
         m_diskBuffer->reset(bufBytes);
     }
-    if (m_audioCapture)
-        m_audioCapture->start();
+    for (auto& cap : m_audioCaptures)
+        cap->start();
     if (m_micCapture)
         m_micCapture->start();
 
@@ -128,8 +136,8 @@ void OpenReplayEngine::stopCapture() {
 
     SetThreadExecutionState(ES_CONTINUOUS);
 
-    if (m_audioCapture)
-        m_audioCapture->stop();
+    for (auto& cap : m_audioCaptures)
+        cap->stop();
     if (m_micCapture)
         m_micCapture->stop();
 
@@ -248,11 +256,12 @@ bool OpenReplayEngine::saveLastMoments(const char* outputPath,
     int64_t durationUs = (int64_t)durationSeconds * 1'000'000;
 
     std::vector<AudioStreamInfo> audioStreams;
-    if (m_audioCapture) {
+    if (!m_audioCaptures.empty()) {
+        auto& cap = m_audioCaptures.front();
         audioStreams.push_back({
-            .sampleRate = m_audioCapture->getSampleRate(),
-            .channels = m_audioCapture->getChannels(),
-            .bitsPerSample = m_audioCapture->getBitsPerSample(),
+            .sampleRate = cap->getSampleRate(),
+            .channels = cap->getChannels(),
+            .bitsPerSample = cap->getBitsPerSample(),
             .bitrate = m_config.audioBitrate,
             .packetType = PacketType::AudioLoopback,
             .title = "Loopback"

@@ -50,6 +50,7 @@ json g_cfgJson;
 std::atomic<bool> g_recording{false};
 std::atomic<bool> g_saving{false};
 std::string g_threadResultMsg;
+std::mutex g_resultMutex;
 std::atomic<float> g_saveProgress{0.0f};
 std::atomic<bool> g_saveSuccess{false};
 std::atomic<bool> g_engineOk{false};
@@ -72,6 +73,10 @@ UINT g_hotkeyScreenshotKey = 'X';
 
 int g_screenshotFormat = 0; // 0=PNG, 1=JPEG
 int g_screenshotQuality = 90;
+int g_screenshotMonitor = -1; // -1 = all monitors, 0+ = specific monitor index
+int g_screenshotResolution = 0; // 0 = Source, 1 = 4K, 2 = 1440p, 3 = 1080p, 4 = 720p
+std::vector<std::string> g_monitorNames;
+std::vector<RECT> g_monitorRects;
 
 HWND g_hwnd = nullptr;
 NOTIFYICONDATAW g_trayIcon = {};
@@ -100,7 +105,6 @@ std::vector<std::string> g_profileNames;
 int g_selectedProfile = -1;
 
 int g_qualityPreset = 2;
-int g_prevQualityPreset = 2;
 
 bool g_showProfileDialog = false;
 char g_profileNameBuf[256] = {};
@@ -122,38 +126,106 @@ void closePanel(HWND hwnd) {
                  SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-static void saveCfg();
+void saveCfg();
+
+struct MonitorEnumData {
+    std::vector<std::string>* names;
+    std::vector<RECT>* rects;
+};
+
+BOOL CALLBACK monitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM lParam) {
+    auto* data = (MonitorEnumData*)lParam;
+    MONITORINFOEXW mi;
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hMon, &mi)) {
+        char name[256];
+        snprintf(name, sizeof(name), "%S (%dx%d)",
+                 mi.szDevice,
+                 mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top);
+        data->names->push_back(name);
+        data->rects->push_back(mi.rcMonitor);
+    }
+    return TRUE;
+}
+
+void refreshMonitors() {
+    g_monitorNames.clear();
+    g_monitorRects.clear();
+    MonitorEnumData data = { &g_monitorNames, &g_monitorRects };
+    EnumDisplayMonitors(nullptr, nullptr, monitorEnumProc, (LPARAM)&data);
+}
+
+static int resolutionHeights[] = { 0, 2160, 1440, 1080, 720 };
+
+static void bilinearResize(const std::vector<uint8_t>& src, int sw, int sh, int ch,
+                            std::vector<uint8_t>& dst, int dw, int dh) {
+    dst.resize((size_t)dw * dh * ch);
+    for (int y = 0; y < dh; y++) {
+        float srcy = (float)y / dh * sh;
+        int iy0 = (int)srcy, iy1 = std::min(iy0 + 1, sh - 1);
+        float fy = srcy - iy0;
+        for (int x = 0; x < dw; x++) {
+            float srcx = (float)x / dw * sw;
+            int ix0 = (int)srcx, ix1 = std::min(ix0 + 1, sw - 1);
+            float fx = srcx - ix0;
+            for (int c = 0; c < ch; c++) {
+                float v = (1 - fy) * ((1 - fx) * src[(size_t)iy0 * sw * ch + ix0 * ch + c] +
+                                        fx * src[(size_t)iy0 * sw * ch + ix1 * ch + c]) +
+                           fy * ((1 - fx) * src[(size_t)iy1 * sw * ch + ix0 * ch + c] +
+                                   fx * src[(size_t)iy1 * sw * ch + ix1 * ch + c]);
+                dst[(size_t)y * dw * ch + x * ch + c] = (uint8_t)(v + 0.5f);
+            }
+        }
+    }
+}
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "external/stb_image_write.h"
 
 void takeScreenshot() {
-    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    RECT capRect;
+    if (g_screenshotMonitor >= 0 && g_screenshotMonitor < (int)g_monitorRects.size()) {
+        capRect = g_monitorRects[g_screenshotMonitor];
+    } else {
+        capRect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        capRect.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        capRect.right = capRect.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        capRect.bottom = capRect.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    }
+    int cw = capRect.right - capRect.left;
+    int ch = capRect.bottom - capRect.top;
+
     HDC hdcScreen = GetDC(nullptr);
     HDC hdcMem = CreateCompatibleDC(hdcScreen);
-    HBITMAP hbm = CreateCompatibleBitmap(hdcScreen, vw, vh);
+    HBITMAP hbm = CreateCompatibleBitmap(hdcScreen, cw, ch);
     SelectObject(hdcMem, hbm);
-    BitBlt(hdcMem, 0, 0, vw, vh, hdcScreen, vx, vy, SRCCOPY);
+    BitBlt(hdcMem, 0, 0, cw, ch, hdcScreen, capRect.left, capRect.top, SRCCOPY);
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = vw;
-    bmi.bmiHeader.biHeight = -vh;
+    bmi.bmiHeader.biWidth = cw;
+    bmi.bmiHeader.biHeight = -ch;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
-    std::vector<uint8_t> pixels(vw * vh * 4);
-    GetDIBits(hdcMem, hbm, 0, vh, pixels.data(), &bmi, DIB_RGB_COLORS);
+    std::vector<uint8_t> pixels((size_t)cw * ch * 4);
+    GetDIBits(hdcMem, hbm, 0, ch, pixels.data(), &bmi, DIB_RGB_COLORS);
 
     DeleteObject(hbm);
     DeleteDC(hdcMem);
     ReleaseDC(nullptr, hdcScreen);
 
-    for (int i = 0; i < vw * vh; i++) {
-        std::swap(pixels[i * 4 + 0], pixels[i * 4 + 2]);
+    for (int i = 0; i < cw * ch; i++) {
+        std::swap(pixels[(size_t)i * 4 + 0], pixels[(size_t)i * 4 + 2]);
+    }
+
+    int outW = cw, outH = ch;
+    std::vector<uint8_t> resized;
+    if (g_screenshotResolution > 0 && resolutionHeights[g_screenshotResolution] < ch) {
+        outH = resolutionHeights[g_screenshotResolution];
+        outW = cw * outH / ch;
+        bilinearResize(pixels, cw, ch, 4, resized, outW, outH);
     }
 
     auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -166,17 +238,21 @@ void takeScreenshot() {
              t.tm_hour, t.tm_min, t.tm_sec,
              g_screenshotFormat == 1 ? "jpg" : "png");
 
+    const uint8_t* outPixels = (g_screenshotResolution > 0 && resolutionHeights[g_screenshotResolution] < ch)
+                               ? resized.data() : pixels.data();
+
     if (g_screenshotFormat == 1) {
-        std::vector<uint8_t> rgb(vw * vh * 3);
-        for (int i = 0; i < vw * vh; i++) {
-            rgb[i * 3 + 0] = pixels[i * 4 + 0];
-            rgb[i * 3 + 1] = pixels[i * 4 + 1];
-            rgb[i * 3 + 2] = pixels[i * 4 + 2];
+        std::vector<uint8_t> rgb((size_t)outW * outH * 3);
+        for (int i = 0; i < outW * outH; i++) {
+            rgb[(size_t)i * 3 + 0] = outPixels[(size_t)i * 4 + 0];
+            rgb[(size_t)i * 3 + 1] = outPixels[(size_t)i * 4 + 1];
+            rgb[(size_t)i * 3 + 2] = outPixels[(size_t)i * 4 + 2];
         }
-        stbi_write_jpg(name, vw, vh, 3, rgb.data(), g_screenshotQuality);
+        stbi_write_jpg(name, outW, outH, 3, rgb.data(), g_screenshotQuality);
     } else {
-        stbi_write_png(name, vw, vh, 4, pixels.data(), vw * 4);
+        stbi_write_png(name, outW, outH, 4, outPixels, outW * 4);
     }
+    refreshClipList();
     showToast(L"Screenshot Saved", L"");
 }
 
@@ -214,6 +290,8 @@ static void loadCfg() {
         g_hotkeyScreenshotKey = g_cfgJson.value("hotkey_screenshot_key", 'X');
         g_screenshotFormat = g_cfgJson.value("screenshot_format", 0);
         g_screenshotQuality = g_cfgJson.value("screenshot_quality", 90);
+        g_screenshotMonitor = g_cfgJson.value("screenshot_monitor", -1);
+        g_screenshotResolution = g_cfgJson.value("screenshot_resolution", 0);
         g_saveDirectory = g_cfgJson.value("save_directory", ".");
         g_defaultClipDuration = g_cfgJson.value("default_clip_duration", 300);
         g_audioOutputFormatIdx = g_cfgJson.value("audio_output_format", 0);
@@ -221,12 +299,17 @@ static void loadCfg() {
         g_panelWidth = g_cfgJson.value("panel_width", 120);
         g_panelHeightPct = g_cfgJson.value("panel_height_pct", 100);
         g_panelAutoScaleY = g_cfgJson.value("panel_autoscale_y", true);
+        g_qualityPreset = g_cfgJson.value("quality_preset", 2);
+        {
+            const char* names[] = {"lossless", "high", "standard", "stream"};
+            OpenReplay::applyQualityPreset(g_config, names[g_qualityPreset]);
+        }
     } catch (const std::exception&) {
         std::cerr << "[Config] parse failed\n";
     }
 }
 
-static void saveCfg() {
+void saveCfg() {
     OpenReplay::configToJson(g_config, g_cfgJson);
     g_cfgJson["save_directory"] = g_saveDirectory;
     g_cfgJson["default_clip_duration"] = g_defaultClipDuration;
@@ -234,7 +317,11 @@ static void saveCfg() {
     g_cfgJson["output_format"] = (int)g_config.outputFormat;
 
     g_cfgJson["audio_output_format"] = g_audioOutputFormatIdx;
-    g_cfgJson["capture_monitor"] = g_config.captureMonitor;
+    {
+        json ids = json::array();
+        for (auto& id : g_config.audioDeviceIds) ids.push_back(id);
+        g_cfgJson["audio_device_ids"] = ids;
+    }
     g_cfgJson["rtmp_url"] = g_rtmpUrl;
     g_cfgJson["overlay_corner"] = overlayCorner();
     g_cfgJson["overlay_size"] = overlaySize();
@@ -251,9 +338,12 @@ static void saveCfg() {
     g_cfgJson["hotkey_screenshot_key"] = (int)g_hotkeyScreenshotKey;
     g_cfgJson["screenshot_format"] = g_screenshotFormat;
     g_cfgJson["screenshot_quality"] = g_screenshotQuality;
+    g_cfgJson["screenshot_monitor"] = g_screenshotMonitor;
+    g_cfgJson["screenshot_resolution"] = g_screenshotResolution;
     g_cfgJson["panel_width"] = g_panelWidth;
     g_cfgJson["panel_height_pct"] = g_panelHeightPct;
     g_cfgJson["panel_autoscale_y"] = g_panelAutoScaleY;
+    g_cfgJson["quality_preset"] = g_qualityPreset;
     std::ofstream cf("config.json");
     if (cf.is_open()) cf << g_cfgJson.dump(4);
 }
@@ -319,7 +409,6 @@ static bool saveToFile(HWND hwnd) {
                 g_recording.store(true);
                 overlayShow(true);
             }
-            g_threadResultMsg = "No audio data captured";
             return false;
         }
     }
@@ -354,8 +443,11 @@ static bool saveToFile(HWND hwnd) {
         overlayShow(true);
     }
 
-    g_threadResultMsg = out.string();
-    if (ok) g_threadResultMsg += " (clip #" + std::to_string(g_clipsSaved) + ")";
+    {
+        std::lock_guard<std::mutex> lock(g_resultMutex);
+        g_threadResultMsg = out.string();
+        if (ok) g_threadResultMsg += " (clip #" + std::to_string(g_clipsSaved) + ")";
+    }
     return ok;
 }
 
@@ -378,10 +470,21 @@ bool streamToUrl() {
         g_recording.store(true);
         overlayShow(true);
     }
-    g_threadResultMsg = ok
-        ? std::string("Streamed to: ") + g_rtmpUrl
-        : "Stream failed";
+    {
+        std::lock_guard<std::mutex> lock(g_resultMutex);
+        g_threadResultMsg = ok
+            ? std::string("Streamed to: ") + g_rtmpUrl
+            : "Stream failed";
+    }
     return ok;
+}
+
+static bool saveToFileSeh(HWND hwnd) {
+    __try {
+        return saveToFile(hwnd);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 void saveClip(HWND hwnd) {
@@ -398,14 +501,13 @@ void saveClip(HWND hwnd) {
     g_saveSuccess.store(false);
     if (g_saveThread.joinable()) g_saveThread.join();
     g_saveThread = std::thread([hwnd]() {
-        bool ok = false;
-        __try {
-            ok = saveToFile(hwnd);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            g_threadResultMsg = "Save failed: unexpected error";
+        bool ok = saveToFileSeh(hwnd);
+        {
+            std::lock_guard<std::mutex> lock(g_resultMutex);
+            if (!ok) g_threadResultMsg = "Save failed: unexpected error";
+            g_lastSaveResult = g_threadResultMsg;
         }
         g_saving.store(false);
-        g_lastSaveResult = g_threadResultMsg.c_str();
         PostMessageA(hwnd, WM_APP_SAVE_DONE, (WPARAM)ok, 0);
     });
 }
@@ -437,6 +539,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 #endif
         refreshClipList();
         refreshProfileCombo();
+        refreshMonitors();
         break;
     }
 
@@ -566,24 +669,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_APP_SAVE_DONE: {
         g_saveProgress.store(wParam ? 1.0f : 0.0f);
+        std::string result;
+        {
+            std::lock_guard<std::mutex> lock(g_resultMutex);
+            result = g_lastSaveResult;
+        }
         if (wParam) {
             playSaveSound();
-            int wn = MultiByteToWideChar(CP_UTF8, 0, g_lastSaveResult.c_str(), -1, nullptr, 0);
+            int wn = MultiByteToWideChar(CP_UTF8, 0, result.c_str(), -1, nullptr, 0);
             std::wstring wpath(wn, L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, g_lastSaveResult.c_str(), -1, wpath.data(), wn);
+            MultiByteToWideChar(CP_UTF8, 0, result.c_str(), -1, wpath.data(), wn);
             size_t pos = wpath.find_last_of(L"\\/");
             std::wstring fname = (pos != std::wstring::npos) ? wpath.substr(pos + 1) : wpath;
             showToast(L"Clip Saved", fname.c_str());
         } else {
             std::wstring errMsg = L"Save failed";
-            int wn = MultiByteToWideChar(CP_UTF8, 0, g_lastSaveResult.c_str(), -1, nullptr, 0);
+            int wn = MultiByteToWideChar(CP_UTF8, 0, result.c_str(), -1, nullptr, 0);
             if (wn > 1) {
                 std::wstring werr(wn, L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, g_lastSaveResult.c_str(), -1, werr.data(), wn);
+                MultiByteToWideChar(CP_UTF8, 0, result.c_str(), -1, werr.data(), wn);
                 errMsg = werr;
             }
             showToast(L"Save Failed", errMsg.c_str());
-            MessageBoxA(hwnd, g_lastSaveResult.c_str(), "Save Error", MB_ICONERROR);
+            MessageBoxA(hwnd, result.c_str(), "Save Error", MB_ICONERROR);
         }
         refreshClipList();
         InvalidateRect(hwnd, nullptr, TRUE);

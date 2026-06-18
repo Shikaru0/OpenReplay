@@ -49,3 +49,8 @@ vcpkg_installed/
 .idea/
 *.user
 *.suo
+
+# Runtime artifacts
+profiles.json
+log.txt
+*.ipch

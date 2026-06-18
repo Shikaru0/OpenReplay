@@ -87,7 +87,11 @@ void configToJson(const RecorderConfig& config, json& j) {
     j["capture_monitor"] = config.captureMonitor;
     j["output_format"] = formatToIndex(config.outputFormat);
     j["rtmp_url"] = config.rtmpUrl;
-    j["audio_device_id"] = config.audioDeviceId;
+    {
+        json ids = json::array();
+        for (auto& id : config.audioDeviceIds) ids.push_back(id);
+        j["audio_device_ids"] = ids;
+    }
     j["mic_device_id"] = config.micDeviceId;
 }
 
@@ -115,7 +119,16 @@ void configFromJson(const json& j, RecorderConfig& config) {
     int fmtIdx = j.value("output_format", 0);
     config.outputFormat = formatFromIndex(fmtIdx);
     config.rtmpUrl = j.value("rtmp_url", "");
-    config.audioDeviceId = j.value("audio_device_id", "");
+    {
+        config.audioDeviceIds.clear();
+        auto arr = j.value("audio_device_ids", json::array());
+        if (arr.empty()) {
+            std::string old = j.value("audio_device_id", "");
+            if (!old.empty()) config.audioDeviceIds.push_back(old);
+        } else {
+            for (auto& a : arr) config.audioDeviceIds.push_back(a.get<std::string>());
+        }
+    }
     config.micDeviceId = j.value("mic_device_id", "");
 }
 
@@ -149,7 +162,10 @@ void ProfileManager::apply(const std::string& name, RecorderConfig& config) {
     if (p.contains("captureMonitor")) config.captureMonitor = p["captureMonitor"];
     if (p.contains("enableMic")) config.enableMic = p["enableMic"];
     if (p.contains("captureCursor")) config.captureCursor = p["captureCursor"];
-    if (p.contains("audioDeviceId")) config.audioDeviceId = p["audioDeviceId"];
+    if (p.contains("audioDeviceIds")) {
+        config.audioDeviceIds.clear();
+        for (auto& a : p["audioDeviceIds"]) config.audioDeviceIds.push_back(a.get<std::string>());
+    }
     if (p.contains("micDeviceId")) config.micDeviceId = p["micDeviceId"];
 }
 
@@ -167,7 +183,11 @@ void ProfileManager::saveCurrent(const std::string& name, const RecorderConfig& 
     p["captureMonitor"] = config.captureMonitor;
     p["enableMic"] = config.enableMic;
     p["captureCursor"] = config.captureCursor;
-    p["audioDeviceId"] = config.audioDeviceId;
+    {
+        json ids = json::array();
+        for (auto& id : config.audioDeviceIds) ids.push_back(id);
+        p["audioDeviceIds"] = ids;
+    }
     p["micDeviceId"] = config.micDeviceId;
     profiles[name] = std::move(p);
 }
