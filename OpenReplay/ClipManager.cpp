@@ -8,32 +8,6 @@
 
 ClipManager::ClipManager() {}
 
-void ClipManager::refresh(const std::string& directory) {
-    m_clips.clear();
-    try {
-        for (auto& entry : fs::directory_iterator(directory)) {
-            auto ext = entry.path().extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            if (isMediaExtension(ext)) {
-                m_clips.push_back(entry.path());
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "[ClipManager] " << e.what() << "\n";
-    }
-}
-
-bool ClipManager::remove(size_t index) {
-    if (index >= m_clips.size()) return false;
-    bool ok = fs::remove(m_clips[index]);
-    if (ok) m_clips.erase(m_clips.begin() + index);
-    return ok;
-}
-
-void ClipManager::clear() {
-    m_clips.clear();
-}
-
 bool ClipManager::isMediaExtension(const std::string& ext) {
     return ext == ".mp4" || ext == ".mkv" || ext == ".webm" || ext == ".mov" ||
            ext == ".avi" || ext == ".wav" || ext == ".flac" || ext == ".mp3" || ext == ".ogg";

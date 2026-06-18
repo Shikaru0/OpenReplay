@@ -9,6 +9,7 @@ void overlaySetSize(int size);
 void overlaySetAlpha(int alpha);
 void overlaySetColor(COLORREF color);
 void overlaySetShowFps(bool show);
+void overlaySetFpsValue(int fps);
 int overlayCorner();
 int overlaySize();
 int overlayAlpha();

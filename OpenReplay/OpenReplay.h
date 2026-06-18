@@ -69,6 +69,7 @@ public:
 
     const char* getCodecName() const;
     bool isInitialized() const { return m_initialized; }
+    bool hasPendingData() const { return m_diskBuffer && m_diskBuffer->getPacketCount() > 0; }
     CaptureStats getStats() const { return m_stats; }
 
 private:
@@ -91,6 +92,7 @@ private:
 
     std::thread m_captureThread;
     std::atomic<bool> m_isCapturing{false};
+    bool m_encoderActive = false;
 
     int64_t m_qpcFreq = 0;
     int64_t m_qpcOrigin = 0;

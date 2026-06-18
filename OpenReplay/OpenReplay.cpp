@@ -85,7 +85,6 @@ bool OpenReplayEngine::init(const RecorderConfig& config) {
             std::cerr << "[Engine] ScreenCapture init failed\n";
             return false;
         }
-        m_screenCapture->setCaptureCursor(config.captureCursor);
         m_stats.isHdr.store(m_screenCapture->isHdr());
     }
 
@@ -96,6 +95,8 @@ bool OpenReplayEngine::init(const RecorderConfig& config) {
 
 void OpenReplayEngine::startCapture() {
     if (!m_initialized || m_isCapturing.exchange(true)) return;
+
+    m_encoderActive = false;
 
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
 
@@ -109,7 +110,11 @@ void OpenReplayEngine::startCapture() {
     m_stats.currentFps.store(0.0);
     m_stats.durationMs.store(0);
 
-    m_diskBuffer->reset();
+    {
+        std::lock_guard<std::mutex> lock(m_configMtx);
+        uint64_t bufBytes = m_config.bufferSizeMB * 1024ULL * 1024;
+        m_diskBuffer->reset(bufBytes);
+    }
     {
         std::lock_guard<std::mutex> lock(m_micMtx);
         m_micQueue.clear();
@@ -138,7 +143,7 @@ void OpenReplayEngine::stopCapture() {
     if (m_captureThread.joinable())
         m_captureThread.join();
 
-    if (m_videoEncoder) {
+    if (m_videoEncoder && m_encoderActive) {
         m_videoEncoder->flush();
 
         if (!m_videoEncoder->getExtradata().empty()) {
@@ -184,6 +189,7 @@ void OpenReplayEngine::captureThreadLoop() {
 
         if (m_screenCapture->captureFrame(framePixels, capW, capH)) {
             m_videoEncoder->encode(framePixels.data(), pts);
+            m_encoderActive = true;
             m_stats.framesEncoded++;
         } else {
             onFrameDropped();
@@ -274,8 +280,9 @@ const char* OpenReplayEngine::getCodecName() const {
 bool OpenReplayEngine::saveLastMoments(const char* outputPath,
                                         int durationSeconds,
                                         Muxer::ProgressCallback progress) {
-    if (!m_initialized || !m_diskBuffer || !m_diskBuffer->isInitialized())
+    if (!m_initialized || !m_diskBuffer || !m_diskBuffer->isInitialized()) {
         return false;
+    }
 
     int64_t endPts = m_diskBuffer->getLatestPts();
     int64_t durationUs = (int64_t)durationSeconds * 1'000'000;
@@ -285,7 +292,7 @@ bool OpenReplayEngine::saveLastMoments(const char* outputPath,
     int audioBPS = m_audioCapture ? m_audioCapture->getBitsPerSample() : 0;
     AVCodecID codecId = m_videoEncoder ? m_videoEncoder->codecId() : AV_CODEC_ID_H264;
 
-    bool result = m_muxer->muxStreaming(
+    return m_muxer->muxStreaming(
         outputPath, m_config.outputFormat,
         m_diskBuffer.get(),
         endPts, durationUs,
@@ -293,8 +300,6 @@ bool OpenReplayEngine::saveLastMoments(const char* outputPath,
         audioSR, audioCh, audioBPS, m_config.audioBitrate,
         codecId, m_config.audioCodec,
         progress);
-
-    return result;
 }
 
 }

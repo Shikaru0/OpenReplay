@@ -4,6 +4,16 @@
 
 namespace OpenReplay {
 
+OutputFormat audioFormatFromIndex(int idx) {
+    switch (idx) {
+        case 0:  return OutputFormat::WAV;
+        case 1:  return OutputFormat::FLAC;
+        case 2:  return OutputFormat::MP3;
+        case 3:  return OutputFormat::OGG;
+        default: return OutputFormat::WAV;
+    }
+}
+
 OutputFormat formatFromIndex(int idx) {
     switch (idx) {
         case 0:  return OutputFormat::MP4;
@@ -16,16 +26,6 @@ OutputFormat formatFromIndex(int idx) {
         case 7:  return OutputFormat::MP3;
         case 8:  return OutputFormat::OGG;
         default: return OutputFormat::MP4;
-    }
-}
-
-OutputFormat audioFormatFromIndex(int idx) {
-    switch (idx) {
-        case 0:  return OutputFormat::WAV;
-        case 1:  return OutputFormat::FLAC;
-        case 2:  return OutputFormat::MP3;
-        case 3:  return OutputFormat::OGG;
-        default: return OutputFormat::WAV;
     }
 }
 
@@ -80,7 +80,6 @@ void configToJson(const RecorderConfig& config, json& j) {
     j["auto_save_on_stop"] = config.autoSaveOnStop;
     j["minimize_to_tray"] = config.minimizeToTray;
     j["enable_pre_analysis"] = config.enablePreAnalysis;
-    j["force_cfr"] = config.forceCfr;
     j["enable_mic"] = config.enableMic;
     j["capture_cursor"] = config.captureCursor;
     j["buffer_file"] = config.bufferFilePath;
@@ -108,7 +107,6 @@ void configFromJson(const json& j, RecorderConfig& config) {
     config.autoSaveOnStop = j.value("auto_save_on_stop", false);
     config.minimizeToTray = j.value("minimize_to_tray", true);
     config.enablePreAnalysis = j.value("enable_pre_analysis", true);
-    config.forceCfr = j.value("force_cfr", true);
     config.enableMic = j.value("enable_mic", false);
     config.captureCursor = j.value("capture_cursor", true);
     config.bufferFilePath = j.value("buffer_file", "OpenReplay_Buffer.dat");

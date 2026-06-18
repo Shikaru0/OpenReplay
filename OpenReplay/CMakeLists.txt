@@ -34,6 +34,7 @@ add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS NOMINMA
 
 set(SOURCES
     main.cpp
+    UI.cpp                 UI.h
     Locale.cpp             Locale.h
     Config.cpp             Config.h
     ClipManager.cpp        ClipManager.h

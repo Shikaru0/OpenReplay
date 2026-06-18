@@ -16,8 +16,6 @@ static const IID IID_IAudioCaptureClient_
 
 namespace OpenReplay {
 
-constexpr int64_t kSilenceDurationThresholdUs = 500000;
-
 std::vector<AudioCapture::DeviceInfo> AudioCapture::enumerateDevices(CaptureMode mode) {
     std::vector<DeviceInfo> devices;
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -154,35 +152,13 @@ bool AudioCapture::init(CaptureMode mode, const std::string& deviceId) {
     m_channels = m_waveFormat->nChannels;
     m_bitsPerSample = m_waveFormat->wBitsPerSample;
 
-    m_eventHandle = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    if (!m_eventHandle) {
-        std::cerr << "[AudioCapture] CreateEvent failed\n";
-        return false;
-    }
-
-    m_stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    if (!m_stopEvent) {
-        std::cerr << "[AudioCapture] CreateEvent(stop) failed\n";
-        return false;
-    }
-
-    DWORD streamFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
-                        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM;
-    if (mode == Loopback)
-        streamFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
+    DWORD streamFlags = (mode == Loopback) ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
 
     hr = m_audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
                                    streamFlags,
                                    0, 0, m_waveFormat, NULL);
     if (FAILED(hr)) {
         std::cerr << "[AudioCapture] AudioClient init failed: 0x"
-                  << std::hex << hr << std::dec << "\n";
-        return false;
-    }
-
-    hr = m_audioClient->SetEventHandle(m_eventHandle);
-    if (FAILED(hr)) {
-        std::cerr << "[AudioCapture] SetEventHandle failed: 0x"
                   << std::hex << hr << std::dec << "\n";
         return false;
     }
@@ -200,97 +176,66 @@ bool AudioCapture::init(CaptureMode mode, const std::string& deviceId) {
 
 void AudioCapture::start() {
     if (m_running.exchange(true)) return;
-    ResetEvent(m_stopEvent);
-    m_silenceDurationUs = 0;
     m_thread = std::thread(&AudioCapture::captureThread, this);
 }
 
 void AudioCapture::stop() {
     if (!m_running.exchange(false)) return;
-    SetEvent(m_stopEvent);
-    if (m_eventHandle) SetEvent(m_eventHandle);
     if (m_thread.joinable()) m_thread.join();
 }
 
-bool AudioCapture::isSilent(const float* samples, size_t count) const {
-    if (count == 0) return true;
-    double sumSq = 0.0;
-    for (size_t i = 0; i < count; ++i) {
-        sumSq += (double)samples[i] * (double)samples[i];
-    }
-    double rms = std::sqrt(sumSq / (double)count);
-    return (float)rms < m_silenceThreshold;
-}
-
 void AudioCapture::captureThread() {
+    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) { return; }
+
     int bpf = m_waveFormat->nBlockAlign;
     int64_t qpcOrigin = 0;
-    HANDLE waitHandles[2] = { m_eventHandle, m_stopEvent };
 
-    HRESULT hr = m_audioClient->Start();
-    if (FAILED(hr)) {
-        std::cerr << "[AudioCapture] Start() failed: 0x"
-                  << std::hex << hr << std::dec << "\n";
+    if (FAILED(m_audioClient->Start())) {
+        std::cerr << "[AudioCapture] Start failed\n";
+        CoUninitialize();
         return;
     }
-
     while (m_running) {
-        DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, 1000);
-
-        if (!m_running) break;
-        if (waitResult == WAIT_TIMEOUT) continue;
-        if (waitResult == WAIT_OBJECT_0 + 1) break;
-        if (waitResult != WAIT_OBJECT_0) continue;
-
-        while (m_running) {
-            UINT32 packetSize = 0;
-            hr = m_captureClient->GetNextPacketSize(&packetSize);
-            if (FAILED(hr) || packetSize == 0) break;
-
-            BYTE* pData = nullptr;
-            UINT32 framesAvailable = 0;
-            DWORD flags = 0;
-            UINT64 qpcPos = 0;
-
-            hr = m_captureClient->GetBuffer(&pData, &framesAvailable,
-                                            &flags, nullptr, &qpcPos);
-            if (FAILED(hr)) break;
-
-            if (qpcOrigin == 0) qpcOrigin = qpcPos;
-
-            if (framesAvailable > 0) {
-                uint32_t bytes = framesAvailable * bpf;
-                int64_t pts = (int64_t)((qpcPos - qpcOrigin) * 1'000'000 / m_qpcFreq);
-
-                bool isSilentFlag = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-                bool isSilentPcm = false;
-
-                if (!isSilentFlag) {
-                    if (m_bitsPerSample == 32 && m_channels > 0) {
-                        isSilentPcm = isSilent((const float*)pData, framesAvailable * m_channels);
-                    }
-                }
-
-                if (isSilentFlag || isSilentPcm) {
-                    m_silenceDurationUs += (int64_t)framesAvailable * 1'000'000 / m_sampleRate;
-                    if (m_silenceDurationUs > kSilenceDurationThresholdUs) {
-                        if (m_silenceBuf.size() < bytes)
-                            m_silenceBuf.resize(bytes, 0);
-                        if (m_callback)
-                            m_callback(m_silenceBuf.data(), bytes, pts);
-                    }
-                } else {
-                    m_silenceDurationUs = 0;
-                    if (m_callback)
-                        m_callback(pData, bytes, pts);
-                }
-            }
-
-            m_captureClient->ReleaseBuffer(framesAvailable);
+        UINT32 packetSize = 0;
+        if (FAILED(m_captureClient->GetNextPacketSize(&packetSize))) {
+            Sleep(1);
+            continue;
         }
+        if (packetSize == 0) {
+            Sleep(1);
+            continue;
+        }
+
+        BYTE* pData = nullptr;
+        UINT32 framesAvailable = 0;
+        DWORD flags = 0;
+        UINT64 qpcPos = 0;
+
+        if (FAILED(m_captureClient->GetBuffer(&pData, &framesAvailable, &flags, NULL, &qpcPos))) {
+            Sleep(1);
+            continue;
+        }
+
+        if (qpcOrigin == 0) qpcOrigin = qpcPos;
+        uint32_t bytes = framesAvailable * bpf;
+        int64_t pts = (int64_t)((qpcPos - qpcOrigin) * 1'000'000 / m_qpcFreq);
+
+        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+            if (m_callback && bytes > 0) {
+                if (m_zeroBuf.size() < bytes)
+                    m_zeroBuf.resize(bytes, 0);
+                m_callback(m_zeroBuf.data(), bytes, pts);
+            }
+        } else {
+            if (m_callback)
+                m_callback(pData, bytes, pts);
+        }
+
+        m_captureClient->ReleaseBuffer(framesAvailable);
     }
 
     m_audioClient->Stop();
+    CoUninitialize();
 }
 
 void AudioCapture::cleanup() {
@@ -299,8 +244,6 @@ void AudioCapture::cleanup() {
     if (m_waveFormat) { CoTaskMemFree(m_waveFormat); m_waveFormat = nullptr; }
     if (m_device) { m_device->Release(); m_device = nullptr; }
     if (m_enumerator) { m_enumerator->Release(); m_enumerator = nullptr; }
-    if (m_eventHandle) { CloseHandle(m_eventHandle); m_eventHandle = nullptr; }
-    if (m_stopEvent) { CloseHandle(m_stopEvent); m_stopEvent = nullptr; }
     if (m_comInitialized) { CoUninitialize(); m_comInitialized = false; }
 }
 

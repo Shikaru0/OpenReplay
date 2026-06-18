@@ -57,7 +57,7 @@ public:
     int64_t getOldestPts() const { return m_oldestPts; }
     int64_t getLatestPts() const { return m_latestPts; }
     bool isInitialized() const { return m_mappedView != nullptr; }
-    void reset();
+    void reset(uint64_t maxBytes = 0);
 
 private:
     struct IndexEntry {

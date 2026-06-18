@@ -268,8 +268,9 @@ void DiskBackedBuffer::setExtradata(const uint8_t* data, uint32_t size) {
     m_extradataInjected = false;
 }
 
-void DiskBackedBuffer::reset() {
+void DiskBackedBuffer::reset(uint64_t maxBytes) {
     std::lock_guard<std::mutex> lock(m_mtx);
+    if (maxBytes > 0) m_fileSize = maxBytes;
 
     if (m_mappedView) {
         UnmapViewOfFile(m_mappedView);

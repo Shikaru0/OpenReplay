@@ -25,7 +25,6 @@ struct RecorderConfig {
     bool autoSaveOnStop = false;
     bool minimizeToTray = true;
     bool enablePreAnalysis = true;
-    bool forceCfr = true;
     bool enableMic = false;
     bool captureCursor = true;
     std::string bufferFilePath = "OpenReplay_Buffer.dat";

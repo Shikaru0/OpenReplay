@@ -29,7 +29,6 @@ public:
     void stop();
 
     void setAudioCallback(AudioCallback cb) { m_callback = std::move(cb); }
-    void setSilenceThreshold(float threshold) { m_silenceThreshold = threshold; }
 
     int getSampleRate() const { return m_sampleRate; }
     int getChannels() const { return m_channels; }
@@ -47,7 +46,6 @@ public:
 private:
     void captureThread();
     void cleanup();
-    bool isSilent(const float* samples, size_t count) const;
 
     IAudioClient* m_audioClient = nullptr;
     IAudioCaptureClient* m_captureClient = nullptr;
@@ -61,17 +59,12 @@ private:
     int m_channels = 2;
     int m_bitsPerSample = 32;
 
-    float m_silenceThreshold = 0.001f;
-    int64_t m_silenceDurationUs = 0;
-
     std::thread m_thread;
     std::atomic<bool> m_running{false};
-    HANDLE m_stopEvent = nullptr;
     AudioCallback m_callback;
 
     int64_t m_qpcFreq = 0;
-    HANDLE m_eventHandle = nullptr;
-    std::vector<uint8_t> m_silenceBuf;
+    std::vector<uint8_t> m_zeroBuf;
 };
 
 }

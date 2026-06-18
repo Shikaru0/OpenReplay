@@ -28,7 +28,6 @@ public:
     bool captureFrame(std::vector<uint8_t>& outPixels, int& outW, int& outH);
 
     bool isHdr() const { return m_isHdr; }
-    void setCaptureCursor(bool capture) { m_captureCursor = capture; }
 
     static int enumerateMonitors();
     static const char* getMonitorName(int idx);
@@ -60,7 +59,6 @@ private:
     bool m_initialized = false;
     bool m_reinitFailed = false;
     bool m_isHdr = false;
-    bool m_captureCursor = true;
 };
 
 }
