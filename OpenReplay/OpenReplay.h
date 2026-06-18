@@ -97,11 +97,6 @@ private:
     int64_t m_qpcFreq = 0;
     int64_t m_qpcOrigin = 0;
 
-    std::mutex m_micMtx;
-    struct MicPacket { std::vector<uint8_t> data; int64_t pts; };
-    std::deque<MicPacket> m_micQueue;
-    std::vector<uint8_t> m_mixBuf;
-    void mixWithMic(uint8_t* data, uint32_t size, int64_t pts);
     void onMicAudioData(const uint8_t* data, uint32_t size, int64_t pts);
 };
 

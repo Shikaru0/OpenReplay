@@ -547,6 +547,16 @@ static void drawCustomizeTab() {
         hotkeyRow(tr("Save"), 1, g_hotkeySaveMod, g_hotkeySaveKey);
         hotkeyRow(tr("Rec"), 2, g_hotkeyToggleMod, g_hotkeyToggleKey);
         hotkeyRow(tr("Panel"), 3, g_hotkeyPanelMod, g_hotkeyPanelKey);
+        hotkeyRow(tr("Screenshot"), 4, g_hotkeyScreenshotMod, g_hotkeyScreenshotKey);
+        ImGui::Spacing();
+        ImGui::Text("%s", tr("Screenshot"));
+        ImGui::SetNextItemWidth(cw);
+        static const char* fmtNames[] = {"PNG", "JPEG"};
+        ImGui::Combo(tr("Format"), &g_screenshotFormat, fmtNames, 2);
+        if (g_screenshotFormat == 1) {
+            ImGui::SetNextItemWidth(cw);
+            ImGui::SliderInt(tr("Quality"), &g_screenshotQuality, 1, 100);
+        }
     }
     ImGui::EndChild();
 }

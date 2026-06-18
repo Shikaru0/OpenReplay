@@ -120,18 +120,24 @@ static AVSampleFormat codecTargetFmt(AVCodecID codecId) {
     }
 }
 
+struct AudioStreamState {
+    AVStream* stream = nullptr;
+    AVRational tb{};
+    bool doEncode = false;
+    AVCodecID codecId = AV_CODEC_ID_NONE;
+    AVCodecContext* encCtx = nullptr;
+    AudioStreamInfo info;
+    bool encoded = false;
+};
+
 struct MuxStreams {
     AVFormatContext* fmtCtx = nullptr;
     AVStream* vStream = nullptr;
-    AVStream* aStream = nullptr;
     AVDictionary* opts = nullptr;
     AVRational vTB{};
-    AVRational aTB{};
     bool hasVideo = false;
+    std::vector<AudioStreamState> audioStates;
     bool hasAudio = false;
-    bool doAudioEncode = false;
-    AVCodecID audioCodecId = AV_CODEC_ID_NONE;
-    AVCodecContext* audioEncCtx = nullptr;
     int64_t ptsOffset = 0;
 };
 
@@ -177,13 +183,15 @@ static void freeMuxStreams(MuxStreams& ms) {
             avio_closep(&ms.fmtCtx->pb);
         avformat_free_context(ms.fmtCtx);
     }
-    if (ms.audioEncCtx)
-        avcodec_free_context(&ms.audioEncCtx);
+    for (auto& as : ms.audioStates) {
+        if (as.encCtx)
+            avcodec_free_context(&as.encCtx);
+    }
 }
 
 static bool setupMuxContext(const char* outputPath, OutputFormat format,
                              int width, int height, int fps,
-                             int audioSampleRate, int audioChannels, int audioBitsPerSample,
+                             const std::vector<AudioStreamInfo>& audioInfos,
                              int audioBitrate,
                              AVCodecID videoCodecId, int audioCodecPref,
                              const std::vector<uint8_t>* extradata,
@@ -221,64 +229,78 @@ static bool setupMuxContext(const char* outputPath, OutputFormat format,
         }
     }
 
-    if (ms.hasAudio) {
-        if (ms.doAudioEncode) {
-            ms.audioCodecId = selectAudioCodec(format, audioCodecPref);
-            std::cerr << "[Muxer] selected audio codec: " << ms.audioCodecId << "\n";
-            if (ms.audioCodecId == AV_CODEC_ID_NONE) {
-                ms.hasAudio = false;
-                ms.doAudioEncode = false;
-            }
-        }
-        if (ms.hasAudio) {
-            ms.aStream = avformat_new_stream(ms.fmtCtx, nullptr);
-            if (!ms.aStream) return false;
-            ms.aStream->id = ms.hasVideo ? 1 : 0;
-            ms.aStream->time_base = { 1, audioSampleRate };
-            ms.aTB = ms.aStream->time_base;
-
-            AVCodecParameters* apar = ms.aStream->codecpar;
-            apar->codec_type = AVMEDIA_TYPE_AUDIO;
-            apar->sample_rate = audioSampleRate;
-            av_channel_layout_default(&apar->ch_layout, audioChannels);
-
-            if (ms.doAudioEncode) {
-                apar->codec_id = ms.audioCodecId;
-                apar->format = codecTargetFmt(ms.audioCodecId);
-            } else {
-                apar->codec_id = pcmCodecId(audioBitsPerSample);
-                apar->format = pcmSampleFmt(audioBitsPerSample);
-                apar->bits_per_coded_sample = audioBitsPerSample;
-            }
+    bool doAudioEncode = Muxer::needsAudioEncode(format) && !audioInfos.empty();
+    AVCodecID audioCodecId = AV_CODEC_ID_NONE;
+    if (doAudioEncode) {
+        audioCodecId = selectAudioCodec(format, audioCodecPref);
+        std::cerr << "[Muxer] selected audio codec: " << audioCodecId << "\n";
+        if (audioCodecId == AV_CODEC_ID_NONE) {
+            doAudioEncode = false;
         }
     }
 
-    if (ms.doAudioEncode && ms.hasAudio && !ms.audioEncCtx) {
-        const AVCodec* codec = avcodec_find_encoder(ms.audioCodecId);
-        if (codec) {
+    for (int i = 0; i < (int)audioInfos.size(); i++) {
+        const auto& info = audioInfos[i];
+        AudioStreamState as;
+        as.info = info;
+        as.doEncode = doAudioEncode;
+
+        AVCodecID codecId = doAudioEncode ? audioCodecId : pcmCodecId(info.bitsPerSample);
+        as.codecId = codecId;
+
+        as.stream = avformat_new_stream(ms.fmtCtx, nullptr);
+        if (!as.stream) return false;
+        as.stream->id = (ms.hasVideo ? 1 : 0) + i;
+        as.stream->time_base = { 1, info.sampleRate };
+        as.tb = as.stream->time_base;
+
+        if (info.title) {
+            av_dict_set(&as.stream->metadata, "title", info.title, 0);
+        }
+
+        AVCodecParameters* apar = as.stream->codecpar;
+        apar->codec_type = AVMEDIA_TYPE_AUDIO;
+        apar->codec_id = codecId;
+        apar->sample_rate = info.sampleRate;
+        av_channel_layout_default(&apar->ch_layout, info.channels);
+
+        if (doAudioEncode) {
+            apar->format = codecTargetFmt(codecId);
+        } else {
+            apar->format = pcmSampleFmt(info.bitsPerSample);
+            apar->bits_per_coded_sample = info.bitsPerSample;
+        }
+
+        ms.audioStates.push_back(std::move(as));
+        ms.hasAudio = true;
+    }
+
+    if (doAudioEncode && ms.hasAudio) {
+        for (auto& as : ms.audioStates) {
+            const AVCodec* codec = avcodec_find_encoder(as.codecId);
+            if (!codec) continue;
             AVCodecContext* enc = avcodec_alloc_context3(codec);
-            if (enc) {
-                AVChannelLayout chLayout;
-                av_channel_layout_default(&chLayout, audioChannels);
-                enc->sample_rate = audioSampleRate;
-                enc->ch_layout = chLayout;
-                enc->sample_fmt = codecTargetFmt(ms.audioCodecId);
-                enc->bit_rate = audioBitrate;
-                enc->time_base = { 1, audioSampleRate };
-                if (avcodec_open2(enc, codec, nullptr) >= 0) {
-                    ms.audioEncCtx = enc;
-                    if (enc->extradata && enc->extradata_size > 0 && ms.aStream) {
-                        AVCodecParameters* apar = ms.aStream->codecpar;
-                        apar->extradata = (uint8_t*)av_mallocz(
-                            (size_t)enc->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
-                        if (apar->extradata) {
-                            std::memcpy(apar->extradata, enc->extradata, enc->extradata_size);
-                            apar->extradata_size = enc->extradata_size;
-                        }
+            if (!enc) continue;
+            AVChannelLayout chLayout;
+            av_channel_layout_default(&chLayout, as.info.channels);
+            enc->sample_rate = as.info.sampleRate;
+            enc->ch_layout = chLayout;
+            enc->sample_fmt = codecTargetFmt(as.codecId);
+            enc->bit_rate = as.info.bitrate;
+            enc->time_base = { 1, as.info.sampleRate };
+            if (avcodec_open2(enc, codec, nullptr) >= 0) {
+                as.encCtx = enc;
+                if (enc->extradata && enc->extradata_size > 0 && as.stream) {
+                    AVCodecParameters* apar = as.stream->codecpar;
+                    apar->extradata = (uint8_t*)av_mallocz(
+                        (size_t)enc->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+                    if (apar->extradata) {
+                        std::memcpy(apar->extradata, enc->extradata, enc->extradata_size);
+                        apar->extradata_size = enc->extradata_size;
                     }
-                } else {
-                    avcodec_free_context(&enc);
                 }
+            } else {
+                avcodec_free_context(&enc);
             }
         }
     }
@@ -464,16 +486,16 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
                           const DiskBackedBuffer* buffer,
                           int64_t endPts, int64_t durationUs,
                           int width, int height, int fps,
-                          int audioSampleRate, int audioChannels,
-                          int audioBitsPerSample, int audioBitrate,
-                          AVCodecID videoCodecId,
+                          const std::vector<AudioStreamInfo>& audioStreams,
                           int audioCodecPref,
+                          AVCodecID videoCodecId,
                           ProgressCallback progress)
 {
     bool hasVideo = isVideoFormat(format);
-    bool hasAudio = audioSampleRate > 0;
+    bool hasAudio = !audioStreams.empty();
     std::cerr << "[Muxer] muxStreaming: path=" << outputPath << " format=" << (int)format
               << " hasVideo=" << hasVideo << " hasAudio=" << hasAudio
+              << " audioStreams=" << audioStreams.size()
               << " endPts=" << endPts << " durationUs=" << durationUs << "\n";
 
     if (!hasVideo && !hasAudio) return false;
@@ -481,7 +503,6 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
     MuxStreams ms;
     ms.hasVideo = hasVideo;
     ms.hasAudio = hasAudio;
-    ms.doAudioEncode = needsAudioEncode(format) && hasAudio;
 
     size_t totalPkts = buffer->getPacketCount();
     std::cerr << "[Muxer] totalPkts=" << totalPkts << "\n";
@@ -496,7 +517,7 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
         uint32_t dataSize;
         if (!buffer->getPacketInfo(i, pts, type, dataSize)) continue;
 
-        if (type == PacketType::AudioData) {
+        if (type == PacketType::AudioData || type == PacketType::AudioLoopback || type == PacketType::AudioMic) {
             totalAudio++;
         } else if (type == PacketType::VideoKeyFrame || type == PacketType::VideoDeltaFrame) {
             totalVideo++;
@@ -511,8 +532,8 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
 
     const auto& extradata = buffer->getExtradata();
     if (!setupMuxContext(outputPath, format, width, height, fps,
-                          audioSampleRate, audioChannels, audioBitsPerSample,
-                          audioBitrate,
+                          audioStreams,
+                          192000,
                           videoCodecId, audioCodecPref, &extradata, ms))
     {
         freeMuxStreams(ms);
@@ -541,7 +562,8 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
         if (type == PacketType::CodecExtradata) continue;
 
         bool isV = (type == PacketType::VideoKeyFrame || type == PacketType::VideoDeltaFrame);
-        if ((isV && !ms.hasVideo) || (!isV && !ms.hasAudio)) continue;
+        bool isAudioType = (type == PacketType::AudioData || type == PacketType::AudioLoopback || type == PacketType::AudioMic);
+        if ((isV && !ms.hasVideo) || (!isV && (!isAudioType || !ms.hasAudio))) continue;
 
         refs.push_back({i, pts, type, isV});
     }
@@ -553,28 +575,32 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
     bool ok = true;
     bool hadError = false;
 
-    if (ms.doAudioEncode && ms.hasAudio) {
-        std::cerr << "[Muxer] preparing audio encode, totalAudio=" << totalAudio << "\n";
+    for (auto& as : ms.audioStates) {
+        if (!as.doEncode) continue;
+        std::cerr << "[Muxer] preparing audio encode for type=" << (int)as.info.packetType
+                  << " title=" << (as.info.title ? as.info.title : "?") << "\n";
         std::vector<RetrievedPacket> audioPkts;
         for (auto& ref : refs) {
             if (ref.isVideo || ref.pts < rangeStart || ref.pts > endPts) continue;
+            if (ref.type != as.info.packetType) continue;
             uint32_t ds = 0;
             PacketType pt;
             int64_t p;
             if (!buffer->getPacketInfo(ref.idx, p, pt, ds)) continue;
             std::vector<uint8_t> d(ds);
             if (buffer->readPacketData(ref.idx, d.data()))
-                audioPkts.push_back({std::move(d), p, PacketType::AudioData});
+                audioPkts.push_back({std::move(d), p, pt});
         }
         std::cerr << "[Muxer] collected " << audioPkts.size() << " audio packets for encoding\n";
         if (!audioPkts.empty()) {
             std::cerr << "[Muxer] calling encodeAndWriteAudio...\n";
-            if (encodeAndWriteAudio(ms.fmtCtx, ms.aStream, audioPkts,
-                audioSampleRate, audioChannels, audioBitsPerSample,
-                ms.audioCodecId, codecTargetFmt(ms.audioCodecId),
-                audioBitrate, ptsOffset, ms.audioEncCtx))
+            if (encodeAndWriteAudio(ms.fmtCtx, as.stream, audioPkts,
+                as.info.sampleRate, as.info.channels, as.info.bitsPerSample,
+                as.codecId, codecTargetFmt(as.codecId),
+                as.info.bitrate, ptsOffset, as.encCtx))
             {
                 written += audioPkts.size();
+                as.encoded = true;
             }
             if (progress && totalToWrite > 0) {
                 float pct = 0.05f + 0.90f * ((float)written / (float)totalToWrite);
@@ -585,14 +611,25 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
 
     for (auto& ref : refs) {
         if (ref.pts < rangeStart || ref.pts > endPts) continue;
-        if (ms.doAudioEncode && !ref.isVideo) continue;
-
-        AVRational tb = ref.isVideo ? ms.vTB : ms.aTB;
 
         uint32_t dataSize = 0;
         PacketType ptype;
         int64_t pts;
         if (!buffer->getPacketInfo(ref.idx, pts, ptype, dataSize)) continue;
+
+        int streamIdx;
+        AVRational tb;
+        if (ref.isVideo) {
+            streamIdx = ms.vStream ? ms.vStream->index : 0;
+            tb = ms.vTB;
+        } else {
+            auto it = std::find_if(ms.audioStates.begin(), ms.audioStates.end(),
+                [ptype](const AudioStreamState& s) { return s.info.packetType == ptype; });
+            if (it == ms.audioStates.end()) continue;
+            if (it->encoded) continue;
+            streamIdx = it->stream->index;
+            tb = it->tb;
+        }
 
         uint8_t* pktData = (uint8_t*)av_malloc(dataSize + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!pktData) { hadError = true; continue; }
@@ -603,9 +640,6 @@ bool Muxer::muxStreaming(const char* outputPath, OutputFormat format,
             continue;
         }
 
-        int streamIdx = ref.isVideo
-            ? (ms.vStream ? ms.vStream->index : 0)
-            : (ms.aStream ? ms.aStream->index : 1);
         int64_t scaledPts = av_rescale_q(pts - ptsOffset, AVRational{1, 1'000'000}, tb);
         int flags = (ref.isVideo && ptype == PacketType::VideoKeyFrame) ? AV_PKT_FLAG_KEY : 0;
 

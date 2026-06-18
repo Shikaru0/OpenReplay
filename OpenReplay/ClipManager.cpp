@@ -10,7 +10,8 @@ ClipManager::ClipManager() {}
 
 bool ClipManager::isMediaExtension(const std::string& ext) {
     return ext == ".mp4" || ext == ".mkv" || ext == ".webm" || ext == ".mov" ||
-           ext == ".avi" || ext == ".wav" || ext == ".flac" || ext == ".mp3" || ext == ".ogg";
+           ext == ".avi" || ext == ".wav" || ext == ".flac" || ext == ".mp3" || ext == ".ogg" ||
+           ext == ".png" || ext == ".jpg" || ext == ".jpeg";
 }
 
 std::string ClipManager::formatSize(uint64_t bytes) {

@@ -17,6 +17,15 @@ enum class OutputFormat {
     MP4, MKV, WEBM, MOV, AVI, WAV, FLAC, MP3, OGG
 };
 
+struct AudioStreamInfo {
+    int sampleRate = 0;
+    int channels = 0;
+    int bitsPerSample = 0;
+    int bitrate = 192000;
+    PacketType packetType = PacketType::AudioLoopback;
+    const char* title = nullptr;
+};
+
 class Muxer {
 public:
     using ProgressCallback = std::function<void(float percent)>;
@@ -25,10 +34,9 @@ public:
                       const DiskBackedBuffer* buffer,
                       int64_t endPts, int64_t durationUs,
                       int width, int height, int fps,
-                      int audioSampleRate, int audioChannels,
-                      int audioBitsPerSample, int audioBitrate,
+                      const std::vector<AudioStreamInfo>& audioStreams,
+                      int audioCodecPref,
                       AVCodecID videoCodecId,
-                      int audioCodecPref = 0,
                       ProgressCallback progress = nullptr);
 
     static const char* extension(OutputFormat fmt);

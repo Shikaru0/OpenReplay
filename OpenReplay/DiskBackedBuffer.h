@@ -12,7 +12,9 @@ enum class PacketType : uint8_t {
     VideoKeyFrame = 0,
     VideoDeltaFrame = 1,
     AudioData = 2,
-    CodecExtradata = 3
+    CodecExtradata = 3,
+    AudioLoopback = 4,
+    AudioMic = 5
 };
 
 #pragma pack(push, 1)

@@ -8,8 +8,6 @@
 namespace OpenReplay {
 
 constexpr int64_t kFpsCalcIntervalMs = 2000;
-constexpr int64_t kMicMixWindowUs = 10000;
-constexpr int64_t kMicQueueDrainUs = 100000;
 
 OpenReplayEngine::OpenReplayEngine() = default;
 
@@ -115,11 +113,6 @@ void OpenReplayEngine::startCapture() {
         uint64_t bufBytes = m_config.bufferSizeMB * 1024ULL * 1024;
         m_diskBuffer->reset(bufBytes);
     }
-    {
-        std::lock_guard<std::mutex> lock(m_micMtx);
-        m_micQueue.clear();
-    }
-
     if (m_audioCapture)
         m_audioCapture->start();
     if (m_micCapture)
@@ -224,38 +217,10 @@ void OpenReplayEngine::onEncodedPacket(const uint8_t* data, uint32_t size,
         isKey ? PacketType::VideoKeyFrame : PacketType::VideoDeltaFrame);
 }
 
-void OpenReplayEngine::mixWithMic(uint8_t* data, uint32_t size, int64_t pts) {
-    std::lock_guard<std::mutex> lock(m_micMtx);
-    int64_t windowUs = kMicMixWindowUs;
-
-    while (!m_micQueue.empty() && m_micQueue.front().pts < pts - kMicQueueDrainUs)
-        m_micQueue.pop_front();
-
-    for (size_t i = 0; i < m_micQueue.size(); ++i) {
-        auto& mp = m_micQueue[i];
-        if (std::abs(mp.pts - pts) > windowUs) continue;
-        if (mp.data.size() != size) continue;
-        float* dest = reinterpret_cast<float*>(data);
-        const float* src = reinterpret_cast<const float*>(mp.data.data());
-        size_t samples = size / sizeof(float);
-        for (size_t s = 0; s < samples; ++s) {
-            float sum = dest[s] + src[s];
-            if (sum < -1.0f) sum = -1.0f;
-            if (sum > 1.0f) sum = 1.0f;
-            dest[s] = sum;
-        }
-        m_micQueue.erase(m_micQueue.begin() + i);
-        break;
-    }
-}
-
 void OpenReplayEngine::onMicAudioData(const uint8_t* data, uint32_t size,
                                        int64_t pts) {
-    MicPacket mp;
-    mp.data.assign(data, data + size);
-    mp.pts = pts;
-    std::lock_guard<std::mutex> lock(m_micMtx);
-    m_micQueue.push_back(std::move(mp));
+    m_diskBuffer->writePacket(data, size, pts, PacketType::AudioMic);
+    m_stats.audioPackets++;
 }
 
 void OpenReplayEngine::onFrameDropped() {
@@ -264,12 +229,7 @@ void OpenReplayEngine::onFrameDropped() {
 
 void OpenReplayEngine::onAudioData(const uint8_t* data, uint32_t size,
                                     int64_t pts) {
-    if (m_mixBuf.size() < size)
-        m_mixBuf.resize(size);
-    std::memcpy(m_mixBuf.data(), data, size);
-    if (m_micCapture)
-        mixWithMic(m_mixBuf.data(), size, pts);
-    m_diskBuffer->writePacket(m_mixBuf.data(), size, pts, PacketType::AudioData);
+    m_diskBuffer->writePacket(data, size, pts, PacketType::AudioLoopback);
     m_stats.audioPackets++;
 }
 
@@ -287,9 +247,28 @@ bool OpenReplayEngine::saveLastMoments(const char* outputPath,
     int64_t endPts = m_diskBuffer->getLatestPts();
     int64_t durationUs = (int64_t)durationSeconds * 1'000'000;
 
-    int audioSR = m_audioCapture ? m_audioCapture->getSampleRate() : 0;
-    int audioCh = m_audioCapture ? m_audioCapture->getChannels() : 0;
-    int audioBPS = m_audioCapture ? m_audioCapture->getBitsPerSample() : 0;
+    std::vector<AudioStreamInfo> audioStreams;
+    if (m_audioCapture) {
+        audioStreams.push_back({
+            .sampleRate = m_audioCapture->getSampleRate(),
+            .channels = m_audioCapture->getChannels(),
+            .bitsPerSample = m_audioCapture->getBitsPerSample(),
+            .bitrate = m_config.audioBitrate,
+            .packetType = PacketType::AudioLoopback,
+            .title = "Loopback"
+        });
+    }
+    if (m_micCapture) {
+        audioStreams.push_back({
+            .sampleRate = m_micCapture->getSampleRate(),
+            .channels = m_micCapture->getChannels(),
+            .bitsPerSample = m_micCapture->getBitsPerSample(),
+            .bitrate = m_config.audioBitrate,
+            .packetType = PacketType::AudioMic,
+            .title = "Microphone"
+        });
+    }
+
     AVCodecID codecId = m_videoEncoder ? m_videoEncoder->codecId() : AV_CODEC_ID_H264;
 
     return m_muxer->muxStreaming(
@@ -297,8 +276,9 @@ bool OpenReplayEngine::saveLastMoments(const char* outputPath,
         m_diskBuffer.get(),
         endPts, durationUs,
         m_config.captureWidth, m_config.captureHeight, m_config.maxFPS,
-        audioSR, audioCh, audioBPS, m_config.audioBitrate,
-        codecId, m_config.audioCodec,
+        audioStreams,
+        m_config.audioCodec,
+        codecId,
         progress);
 }
 

@@ -15,6 +15,8 @@
 #include <mutex>
 #include <ctime>
 #include <cstring>
+#include <vector>
+#include <cstdint>
 
 #include "OpenReplay.h"
 #include "Muxer.h"
@@ -58,12 +60,18 @@ std::vector<OpenReplay::AudioCapture::DeviceInfo> g_audioDevices, g_micDevices;
 int g_hotkeySaveId = 1;
 int g_hotkeyToggleId = 2;
 int g_hotkeyPanelId = 3;
+int g_hotkeyScreenshotId = 4;
 UINT g_hotkeySaveMod = MOD_CONTROL | MOD_SHIFT;
 UINT g_hotkeySaveKey = 'R';
 UINT g_hotkeyToggleMod = MOD_CONTROL | MOD_SHIFT;
 UINT g_hotkeyToggleKey = 'S';
 UINT g_hotkeyPanelMod = MOD_ALT;
 UINT g_hotkeyPanelKey = 'G';
+UINT g_hotkeyScreenshotMod = MOD_CONTROL | MOD_SHIFT;
+UINT g_hotkeyScreenshotKey = 'X';
+
+int g_screenshotFormat = 0; // 0=PNG, 1=JPEG
+int g_screenshotQuality = 90;
 
 HWND g_hwnd = nullptr;
 NOTIFYICONDATAW g_trayIcon = {};
@@ -116,13 +124,71 @@ void closePanel(HWND hwnd) {
 
 static void saveCfg();
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "external/stb_image_write.h"
+
+void takeScreenshot() {
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HBITMAP hbm = CreateCompatibleBitmap(hdcScreen, vw, vh);
+    SelectObject(hdcMem, hbm);
+    BitBlt(hdcMem, 0, 0, vw, vh, hdcScreen, vx, vy, SRCCOPY);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = vw;
+    bmi.bmiHeader.biHeight = -vh;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    std::vector<uint8_t> pixels(vw * vh * 4);
+    GetDIBits(hdcMem, hbm, 0, vh, pixels.data(), &bmi, DIB_RGB_COLORS);
+
+    DeleteObject(hbm);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdcScreen);
+
+    for (int i = 0; i < vw * vh; i++) {
+        std::swap(pixels[i * 4 + 0], pixels[i * 4 + 2]);
+    }
+
+    auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    struct tm t;
+    localtime_s(&t, &now);
+    char name[256];
+    snprintf(name, sizeof(name), "%s/screenshot_%04d%02d%02d_%02d%02d%02d.%s",
+             g_saveDirectory.c_str(),
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec,
+             g_screenshotFormat == 1 ? "jpg" : "png");
+
+    if (g_screenshotFormat == 1) {
+        std::vector<uint8_t> rgb(vw * vh * 3);
+        for (int i = 0; i < vw * vh; i++) {
+            rgb[i * 3 + 0] = pixels[i * 4 + 0];
+            rgb[i * 3 + 1] = pixels[i * 4 + 1];
+            rgb[i * 3 + 2] = pixels[i * 4 + 2];
+        }
+        stbi_write_jpg(name, vw, vh, 3, rgb.data(), g_screenshotQuality);
+    } else {
+        stbi_write_png(name, vw, vh, 4, pixels.data(), vw * 4);
+    }
+    showToast(L"Screenshot Saved", L"");
+}
+
 void applyHotkeyBindings(HWND hwnd) {
     UnregisterHotKey(hwnd, g_hotkeySaveId);
     UnregisterHotKey(hwnd, g_hotkeyToggleId);
     UnregisterHotKey(hwnd, g_hotkeyPanelId);
+    UnregisterHotKey(hwnd, g_hotkeyScreenshotId);
     RegisterHotKey(hwnd, g_hotkeySaveId, g_hotkeySaveMod, g_hotkeySaveKey);
     RegisterHotKey(hwnd, g_hotkeyToggleId, g_hotkeyToggleMod, g_hotkeyToggleKey);
     RegisterHotKey(hwnd, g_hotkeyPanelId, g_hotkeyPanelMod, g_hotkeyPanelKey);
+    RegisterHotKey(hwnd, g_hotkeyScreenshotId, g_hotkeyScreenshotMod, g_hotkeyScreenshotKey);
     saveCfg();
 }
 
@@ -144,6 +210,10 @@ static void loadCfg() {
         g_hotkeyToggleKey = g_cfgJson.value("hotkey_toggle_key", 'S');
         g_hotkeyPanelMod = g_cfgJson.value("hotkey_panel_mod", MOD_ALT);
         g_hotkeyPanelKey = g_cfgJson.value("hotkey_panel_key", 'G');
+        g_hotkeyScreenshotMod = g_cfgJson.value("hotkey_screenshot_mod", MOD_CONTROL | MOD_SHIFT);
+        g_hotkeyScreenshotKey = g_cfgJson.value("hotkey_screenshot_key", 'X');
+        g_screenshotFormat = g_cfgJson.value("screenshot_format", 0);
+        g_screenshotQuality = g_cfgJson.value("screenshot_quality", 90);
         g_saveDirectory = g_cfgJson.value("save_directory", ".");
         g_defaultClipDuration = g_cfgJson.value("default_clip_duration", 300);
         g_audioOutputFormatIdx = g_cfgJson.value("audio_output_format", 0);
@@ -177,6 +247,10 @@ static void saveCfg() {
     g_cfgJson["hotkey_toggle_key"] = (int)g_hotkeyToggleKey;
     g_cfgJson["hotkey_panel_mod"] = (int)g_hotkeyPanelMod;
     g_cfgJson["hotkey_panel_key"] = (int)g_hotkeyPanelKey;
+    g_cfgJson["hotkey_screenshot_mod"] = (int)g_hotkeyScreenshotMod;
+    g_cfgJson["hotkey_screenshot_key"] = (int)g_hotkeyScreenshotKey;
+    g_cfgJson["screenshot_format"] = g_screenshotFormat;
+    g_cfgJson["screenshot_quality"] = g_screenshotQuality;
     g_cfgJson["panel_width"] = g_panelWidth;
     g_cfgJson["panel_height_pct"] = g_panelHeightPct;
     g_cfgJson["panel_autoscale_y"] = g_panelAutoScaleY;
@@ -353,6 +427,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         RegisterHotKey(hwnd, g_hotkeySaveId, g_hotkeySaveMod, g_hotkeySaveKey);
         RegisterHotKey(hwnd, g_hotkeyToggleId, g_hotkeyToggleMod, g_hotkeyToggleKey);
         RegisterHotKey(hwnd, g_hotkeyPanelId, g_hotkeyPanelMod, g_hotkeyPanelKey);
+        RegisterHotKey(hwnd, g_hotkeyScreenshotId, g_hotkeyScreenshotMod, g_hotkeyScreenshotKey);
         overlayCreate();
         initTrayIcon(hwnd);
 #ifdef HAS_IMGUI
@@ -400,6 +475,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_HOTKEY:
         if (wParam == g_hotkeySaveId) {
             saveClip(hwnd);
+        } else if (wParam == g_hotkeyScreenshotId) {
+            takeScreenshot();
         } else if (wParam == g_hotkeyPanelId) {
             if (g_panelActive) {
                 closePanel(hwnd);
@@ -665,6 +742,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int show) {
                         g_hotkeyToggleMod = mods; g_hotkeyToggleKey = (UINT)captured;
                     } else if (g_capturingHotkeyFor == 3) {
                         g_hotkeyPanelMod = mods; g_hotkeyPanelKey = (UINT)captured;
+                    } else if (g_capturingHotkeyFor == 4) {
+                        g_hotkeyScreenshotMod = mods; g_hotkeyScreenshotKey = (UINT)captured;
                     }
                     g_capturingHotkeyFor = 0;
                     applyHotkeyBindings(hwnd);
@@ -684,6 +763,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int show) {
         UnregisterHotKey(hwnd, g_hotkeySaveId);
         UnregisterHotKey(hwnd, g_hotkeyToggleId);
         UnregisterHotKey(hwnd, g_hotkeyPanelId);
+        UnregisterHotKey(hwnd, g_hotkeyScreenshotId);
     }
 
     return 0;
