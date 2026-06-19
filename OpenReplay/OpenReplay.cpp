@@ -119,13 +119,128 @@ void OpenReplayEngine::startCapture() {
         uint64_t bufBytes = m_config.bufferSizeMB * 1024ULL * 1024;
         m_diskBuffer->reset(bufBytes);
     }
+
+    if (m_config.enableVideo) {
+        bool needsReinit = false;
+
+        if (!m_screenCapture) {
+            needsReinit = true;
+            std::cout << "[Engine] First-time initialization\n";
+        }
+        else if (m_config.captureMonitor != m_lastCaptureMonitor) {
+            needsReinit = true;
+            std::cout << "[Engine]    MONITOR SWITCH DETECTED!\n";
+            std::cout << "[Engine]    Old: Monitor #" << m_lastCaptureMonitor << "\n";
+            std::cout << "[Engine]    New: Monitor #" << m_config.captureMonitor << "\n";
+        }
+
+        if (needsReinit) {
+            if (m_screenCapture) {
+                std::cout << "[Engine] Shutting down old ScreenCapture...\n";
+
+                if (m_captureThread.joinable()) {
+                    m_isCapturing.store(false); 
+                    m_captureThread.join();
+                    m_isCapturing.store(true);  
+                }
+
+                m_screenCapture->shutdown();
+                m_screenCapture.reset();
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                std::cout << "[Engine] Old resources released (waited 200ms)\n";
+            }
+
+            m_screenCapture = std::make_unique<ScreenCapture>();
+
+            std::cout << "[Engine] Initializing ScreenCapture for Monitor #"
+                << m_config.captureMonitor << "...\n";
+
+            if (!m_screenCapture->init(m_config.captureMonitor)) {
+                std::cerr << "[Engine] Failed to init ScreenCapture!\n";
+
+                m_screenCapture->shutdown();
+                m_screenCapture.reset();
+                m_isCapturing.store(false);
+                return;
+            }
+
+            std::cout << "[Engine] ScreenCapture initialized successfully!\n"
+                << "         Resolution: " << m_screenCapture->width()
+                << "x" << m_screenCapture->height() << "\n";
+
+            {
+                std::lock_guard<std::mutex> lock(m_configMtx);
+                m_config.captureWidth = m_screenCapture->width();
+                m_config.captureHeight = m_screenCapture->height();
+            }
+
+            m_stats.isHdr.store(m_screenCapture->isHdr());
+
+            if (m_videoEncoder) {
+                std::cout << "[Engine] Reinitializing video encoder for "
+                    << m_screenCapture->width() << "x" << m_screenCapture->height() << "\n";
+                m_videoEncoder->shutdown();
+
+                if (!m_videoEncoder->init(
+                    m_screenCapture->width(),
+                    m_screenCapture->height(),
+                    m_config.maxFPS,
+                    m_config.videoBitrate,
+                    m_config.keyframeIntervalSec,
+                    m_config.encoderPreset.c_str(),
+                    m_config.vbvBufferMs,
+                    m_config.enablePreAnalysis)) {
+                    std::cerr << "[Engine] Failed to reinit video encoder!\n";
+                    m_screenCapture->shutdown();
+                    m_screenCapture.reset();
+                    m_isCapturing.store(false);
+                    return;
+                }
+                std::cout << "[Engine] Video encoder ready\n";
+            }
+            else {
+                m_videoEncoder = std::make_unique<VideoEncoder>();
+                m_videoEncoder->setPacketCallback(
+                    [this](const uint8_t* d, uint32_t s, int64_t p, bool k) {
+                        onEncodedPacket(d, s, p, k);
+                    });
+
+                if (!m_videoEncoder->init(
+                    m_screenCapture->width(),
+                    m_screenCapture->height(),
+                    m_config.maxFPS,
+                    m_config.videoBitrate,
+                    m_config.keyframeIntervalSec,
+                    m_config.encoderPreset.c_str(),
+                    m_config.vbvBufferMs,
+                    m_config.enablePreAnalysis)) {
+                    std::cerr << "[Engine] Failed to init video encoder\n";
+                    m_screenCapture->shutdown();
+                    m_screenCapture.reset();
+                    m_isCapturing.store(false);
+                    return;
+                }
+            }
+
+            m_lastCaptureMonitor = m_config.captureMonitor;
+            std::cout << "[Engine] NOW RECORDING FROM MONITOR #"
+                << m_lastCaptureMonitor << "\n";
+        }
+        else {
+            std::cout << "[Engine] Reusing existing ScreenCapture (Monitor #"
+                << m_lastCaptureMonitor << ")\n";
+        }
+    }
+
     for (auto& cap : m_audioCaptures)
         cap->start();
     if (m_micCapture)
         m_micCapture->start();
 
-    if (m_config.enableVideo) {
+    if (m_config.enableVideo && m_screenCapture) {
         m_captureThread = std::thread(&OpenReplayEngine::captureThreadLoop, this);
+        std::cout << "[Engine] CAPTURE STARTED\n";
     }
 }
 

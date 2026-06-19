@@ -1,291 +1,586 @@
-#include "ScreenCapture.h"
+﻿#include "ScreenCapture.h"
 #include <iostream>
 #include <cstring>
-#include <string>
-#include <thread>
-#include <algorithm>
-#include <d3d11_1.h>
-#include <dxgi1_6.h>
+#include <dxgi1_2.h>
 
 namespace OpenReplay {
 
-constexpr DWORD kAcquireTimeoutMs = 1;
-
-static int g_monitorCount = 0;
-static std::string g_monitorNames[8];
-static LUID g_adapterLuids[8];
-static UINT g_adapterOutputIdx[8];
-
-struct WinMon {
-    std::wstring deviceName;
-    RECT rect;
-};
-
-struct EnumMonCtx { std::vector<WinMon>* out; };
-
-static BOOL CALLBACK enumMonCB(HMONITOR hMon, HDC, LPRECT, LPARAM lParam) {
-    auto* ctx = (EnumMonCtx*)lParam;
-    MONITORINFOEXW mi;
-    mi.cbSize = sizeof(mi);
-    if (GetMonitorInfoW(hMon, &mi)) {
-        ctx->out->push_back({ mi.szDevice, mi.rcMonitor });
-    }
-    return TRUE;
-}
-
-bool ScreenCapture::init(int monitorIdx) {
-    if (m_initialized) return true;
-    m_monitorIdx = monitorIdx;
-
-    if (enumerateMonitors() == 0) return false;
-    if (monitorIdx < 0 || monitorIdx >= g_monitorCount) return false;
-
-    IDXGIFactory1* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
-
-    LUID targetLuid = g_adapterLuids[monitorIdx];
-    UINT targetOutputIdx = g_adapterOutputIdx[monitorIdx];
-
-    IDXGIAdapter* targetAdapter = nullptr;
+    ScreenCapture::ScreenCapture()
+        : m_device(nullptr)
+        , m_context(nullptr)
+        , m_adapter(nullptr)
+        , m_output(nullptr)
+        , m_duplication(nullptr)
+        , m_width(0)
+        , m_height(0)
+        , m_hdr(false)
+        , m_ownsDevice(true)
+        , m_initialized(false)
     {
-        IDXGIAdapter* adapter = nullptr;
-        for (UINT ai = 0; factory->EnumAdapters(ai, &adapter) != DXGI_ERROR_NOT_FOUND; ++ai) {
-            DXGI_ADAPTER_DESC adesc;
-            if (SUCCEEDED(adapter->GetDesc(&adesc)) &&
-                std::memcmp(&adesc.AdapterLuid, &targetLuid, sizeof(LUID)) == 0) {
-                targetAdapter = adapter;
-                targetAdapter->AddRef();
-                adapter->Release();
+    }
+
+    ScreenCapture::~ScreenCapture() {
+        shutdown();
+    }
+
+    void ScreenCapture::shutdown() {
+        std::lock_guard<std::mutex> lock(m_mtx);
+
+        if (!m_initialized) return;
+
+        std::cout << "[ScreenCapture] Shutdown initiated\n";
+
+        if (m_duplication) {
+            m_duplication->ReleaseFrame();
+            m_duplication->Release();
+            m_duplication = nullptr;
+            std::cout << "[ScreenCapture] Released IDXGIOutputDuplication\n";
+        }
+
+        if (m_output) {
+            m_output->Release();
+            m_output = nullptr;
+            std::cout << "[ScreenCapture] Released IDXGIOutput\n";
+        }
+
+        if (m_adapter) {
+            m_adapter->Release();
+            m_adapter = nullptr;
+            std::cout << "[ScreenCapture] Released IDXGIAdapter\n";
+        }
+
+        if (m_device && m_ownsDevice) {
+            if (m_context) {
+                m_context->Release();
+                m_context = nullptr;
+                std::cout << "[ScreenCapture] Released ID3D11DeviceContext\n";
+            }
+
+            m_device->Release();
+            m_device = nullptr;
+            std::cout << "[ScreenCapture] Released ID3D11Device\n";
+        }
+        else if (m_device && !m_ownsDevice) {
+            m_device->Release();
+            m_device = nullptr;
+            m_context = nullptr;  
+            std::cout << "[ScreenCapture] Released reference to external device\n";
+        }
+
+        if (m_stagingTexture) {
+            m_stagingTexture->Release();
+            m_stagingTexture = nullptr;
+        }
+
+        m_width = 0;
+        m_height = 0;
+        m_hdr = false;
+        m_initialized = false;
+
+        std::cout << "[ScreenCapture] Shutdown complete\n";
+    }
+
+    bool ScreenCapture::init(int monitorIndex,
+        ID3D11Device* existingDevice,
+        ID3D11DeviceContext* existingContext)
+    {
+        std::lock_guard<std::mutex> lock(m_mtx);
+
+        if (m_initialized) {
+            shutdown();
+        }
+
+        HRESULT hr;
+
+        std::cout << "[ScreenCapture] Initializing for monitor index " << monitorIndex << "\n";
+
+        if (existingDevice && existingContext) {
+            std::cout << "[ScreenCapture] Using shared D3D11 device\n";
+            m_device = existingDevice;
+            m_context = existingContext;
+            m_ownsDevice = false;
+
+            m_device->AddRef();
+            m_context->AddRef();
+        }
+        else {
+            std::cout << "[ScreenCapture] Creating new D3D11 device\n";
+
+            D3D_FEATURE_LEVEL featureLevel;
+            UINT createFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT; 
+
+            hr = D3D11CreateDevice(
+                nullptr,                    // Use default adapter 
+                D3D_DRIVER_TYPE_HARDWARE,
+                nullptr,                    // No software rasterizer
+                createFlags,
+                nullptr, 0,                 // Default feature levels
+                D3D11_SDK_VERSION,
+                &m_device,
+                &featureLevel,
+                &m_context
+            );
+
+            if (FAILED(hr)) {
+                std::cerr << "[ScreenCapture] D3D11CreateDevice failed: 0x"
+                    << std::hex << hr << std::dec << "\n";
+
+                hr = D3D11CreateDevice(
+                    nullptr,
+                    D3D_DRIVER_TYPE_WARP,
+                    nullptr,
+                    createFlags,
+                    nullptr, 0,
+                    D3D11_SDK_VERSION,
+                    &m_device,
+                    &featureLevel,
+                    &m_context
+                );
+
+                if (FAILED(hr)) {
+                    std::cerr << "[ScreenCapture] WARP fallback also failed: 0x"
+                        << std::hex << hr << std::dec << "\n";
+                    return false;
+                }
+                std::cout << "[ScreenCapture] Using WARP (software) device\n";
+            }
+
+            m_ownsDevice = true;
+            std::cout << "[ScreenCapture] D3D11 device created (Feature Level "
+                << featureLevel << ")\n";
+        }
+
+        IDXGIDevice* dxgiDevice = nullptr;
+        hr = m_device->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+        if (FAILED(hr)) {
+            std::cerr << "[ScreenCapture] Failed to get IDXGIDevice: 0x"
+                << std::hex << hr << std::dec << "\n";
+            if (m_ownsDevice) cleanupDeviceOnly();
+            return false;
+        }
+
+        IDXGIAdapter* adapterFromDevice = nullptr;
+        hr = dxgiDevice->GetAdapter(&adapterFromDevice);
+        dxgiDevice->Release();
+
+        if (FAILED(hr) || !adapterFromDevice) {
+            std::cerr << "[ScreenCapture] Failed to get adapter from device\n";
+            if (m_ownsDevice) cleanupDeviceOnly();
+            return false;
+        }
+
+        DXGI_OUTPUT_DESC outputDesc = {};
+        bool foundOutput = false;
+
+        std::cout << "[ScreenCapture] Enumerating outputs for monitor " << monitorIndex << "...\n";
+
+        UINT outputCount = 0;
+        for (UINT i = 0; ; ++i) {
+            IDXGIOutput* tempOutput = nullptr;
+            hr = adapterFromDevice->EnumOutputs(i, &tempOutput);
+
+            if (hr == DXGI_ERROR_NOT_FOUND) {
+                std::cout << "[ScreenCapture] Found " << i << " total outputs\n";
                 break;
             }
-            adapter->Release();
+
+            if (FAILED(hr)) {
+                std::cerr << "[ScreenCapture] EnumOutputs[" << i << "] failed: 0x"
+                    << std::hex << hr << std::dec << "\n";
+                continue;
+            }
+
+            if ((int)i == monitorIndex) {
+                std::cout << "[ScreenCapture] Found target output at index " << i << "\n";
+
+                IDXGIOutput1* output1 = nullptr;
+                hr = tempOutput->QueryInterface(IID_PPV_ARGS(&output1));
+
+                if (SUCCEEDED(hr) && output1) {
+                    output1->GetDesc(&outputDesc);
+                    output1->Release();
+
+                    m_output = tempOutput;  
+                    foundOutput = true;
+
+                    std::cout << "[ScreenCapture] Output name: "
+                        << convertWStringToString(outputDesc.DeviceName)
+                        << " | Attached: " << (outputDesc.AttachedToDesktop ? "Yes" : "No")
+                        << " | Rotation: " << outputDesc.Rotation
+                        << " | Rect: L=" << outputDesc.DesktopCoordinates.left
+                        << " T=" << outputDesc.DesktopCoordinates.top
+                        << " R=" << outputDesc.DesktopCoordinates.right
+                        << " B=" << outputDesc.DesktopCoordinates.bottom
+                        << "\n";
+                }
+                else {
+                    tempOutput->Release();
+                    std::cerr << "[ScreenCapture] Failed to query IDXGIOutput1\n";
+                }
+            }
+            else {
+                tempOutput->Release(); 
+            }
         }
+
+        adapterFromDevice->Release();
+
+        if (!foundOutput || !m_output) {
+            std::cerr << "[ScreenCapture] Monitor index " << monitorIndex
+                << " not found! Available range: 0-" << (outputCount - 1) << "\n";
+            if (m_ownsDevice) cleanupDeviceOnly();
+            return false;
+        }
+
+        IDXGIDevice* dxgiDevForAdapter = nullptr;
+        hr = m_device->QueryInterface(IID_PPV_ARGS(&dxgiDevForAdapter));
+        if (SUCCEEDED(hr)) {
+            dxgiDevForAdapter->GetAdapter(&m_adapter);
+            dxgiDevForAdapter->Release();
+        }
+
+        if (!m_adapter) {
+            std::cerr << "[ScreenCapture] Failed to retain adapter reference\n";
+            m_output->Release();
+            m_output = nullptr;
+            if (m_ownsDevice) cleanupDeviceOnly();
+            return false;
+        }
+
+        std::cout << "[ScreenCapture] Attempting DuplicateOutput...\n";
+
+        IDXGIOutput1* output1 = nullptr;
+        hr = m_output->QueryInterface(IID_PPV_ARGS(&output1));
+        if (FAILED(hr)) {
+            std::cerr << "[ScreenCapture] Failed to query IDXGIOutput1: 0x"
+                << std::hex << hr << std::dec << "\n";
+            m_output->Release();
+            m_output = nullptr;
+            m_adapter->Release();
+            m_adapter = nullptr;
+            if (m_ownsDevice) cleanupDeviceOnly();
+            return false;
+        }
+
+        hr = output1->DuplicateOutput(m_device, &m_duplication);
+        output1->Release();
+
+        if (FAILED(hr)) {
+            switch (hr) {
+            case DXGI_ERROR_ACCESS_LOST:
+                std::cerr << "[ScreenCapture] DXGI_ERROR_ACCESS_LOST: "
+                    << "Desktop duplication access lost (another app? mode change?)\n";
+                break;
+            case E_ACCESSDENIED:
+                std::cerr << "[ScreenCapture] E_ACCESSDENIED: "
+                    << "Permission denied (UAC? secure desktop?)\n";
+                break;
+            case E_INVALIDARG:
+                std::cerr << "[ScreenCapture] E_INVALIDARG: "
+                    << "Invalid arguments to DuplicateOutput\n";
+                break;
+            case DXGI_ERROR_UNSUPPORTED:
+                std::cerr << "[ScreenCapture] DXGI_ERROR_UNSUPPORTED: "
+                    << "Desktop duplication not supported on this OS/hardware\n";
+                break;
+            case DXGI_ERROR_SESSION_DISCONNECTED:
+                std::cerr << "[ScreenCapture] DXGI_ERROR_SESSION_DISCONNECTED: "
+                    << "Session disconnected (RDP? user switch?)\n";
+                break;
+            default:
+                std::cerr << "[ScreenCapture] DuplicateOutput failed: 0x"
+                    << std::hex << hr << " (" << hr << ")" << std::dec << "\n";
+                break;
+            }
+
+            m_output->Release();
+            m_output = nullptr;
+            m_adapter->Release();
+            m_adapter = nullptr;
+            if (m_ownsDevice) cleanupDeviceOnly();
+            return false;
+        }
+
+        std::cout << "[ScreenCapture] Desktop Duplication acquired successfully!\n";
+
+        m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
+        m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+
+        if (outputDesc.Rotation == DXGI_MODE_ROTATION_ROTATE90 ||
+            outputDesc.Rotation == DXGI_MODE_ROTATION_ROTATE270) {
+            std::swap(m_width, m_height);
+            std::cout << "[ScreenCapture] Display is rotated, swapped dimensions to "
+                << m_width << "x" << m_height << "\n";
+        }
+
+        m_hdr = checkHdrSupport(outputDesc);
+
+        std::cout << "[ScreenCapture] Resolution: " << m_width << "x" << m_height
+            << " | HDR: " << (m_hdr ? "Yes" : "No") << "\n";
+
+        D3D11_TEXTURE2D_DESC texDesc = {};
+        texDesc.Width = m_width;
+        texDesc.Height = m_height;
+        texDesc.MipLevels = 1;
+        texDesc.ArraySize = 1;
+        texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;  
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Usage = D3D11_USAGE_STAGING;
+        texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        texDesc.BindFlags = 0;
+        texDesc.MiscFlags = 0;
+
+        hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_stagingTexture);
+        if (FAILED(hr)) {
+            std::cerr << "[ScreenCapture] Failed to create staging texture: 0x"
+                << std::hex << hr << std::dec << "\n";
+            m_stagingTexture = nullptr;
+        }
+        else {
+            std::cout << "[ScreenCapture] Staging texture created\n";
+        }
+
+        m_initialized = true;
+        std::cout << "[ScreenCapture] Initialization COMPLETE for monitor "
+            << monitorIndex << "\n";
+
+        return true;
     }
-    factory->Release();
-    if (!targetAdapter) return false;
 
-    D3D_FEATURE_LEVEL levels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0
-    };
+    bool ScreenCapture::captureFrame(std::vector<uint8_t>& framePixels, int& outWidth, int& outHeight) {
+        std::lock_guard<std::mutex> lock(m_mtx);
 
-    HRESULT hr = D3D11CreateDevice(targetAdapter, D3D_DRIVER_TYPE_UNKNOWN,
-                                    nullptr, 0, levels, 2,
-                                    D3D11_SDK_VERSION, &m_d3dDevice,
-                                    &m_featureLevel, &m_d3dCtx);
-    if (FAILED(hr) || !m_d3dDevice || !m_d3dCtx) {
-        targetAdapter->Release();
+        if (!m_initialized || !m_duplication || !m_device || !m_context) {
+            return false;
+        }
+
+        HRESULT hr;
+        DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
+        IDXGIResource* desktopResource = nullptr;
+
+        const UINT ACQUIRE_TIMEOUT_MS = 50; 
+
+        hr = m_duplication->AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &frameInfo, &desktopResource);
+
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            return false;
+        }
+
+        if (hr == DXGI_ERROR_ACCESS_LOST) {
+            std::cerr << "[ScreenCapture] Access lost during capture, need reinit\n";
+            m_duplication->Release();
+            m_duplication = nullptr;
+            m_initialized = false;
+            return false;
+        }
+
+        if (hr == DXGI_ERROR_INVALID_CALL) {
+            m_duplication->ReleaseFrame();
+
+            hr = m_duplication->AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &frameInfo, &desktopResource);
+            if (FAILED(hr)) {
+                return false;
+            }
+        }
+
+        if (FAILED(hr)) {
+            std::cerr << "[ScreenCapture] AcquireNextFrame failed: 0x"
+                << std::hex << hr << std::dec << "\n";
+            return false;
+        }
+
+        ID3D11Texture2D* desktopTexture = nullptr;
+        hr = desktopResource->QueryInterface(IID_PPV_ARGS(&desktopTexture));
+        desktopResource->Release();
+
+        if (FAILED(hr)) {
+            m_duplication->ReleaseFrame();
+            std::cerr << "[ScreenCapture] Failed to query texture interface\n";
+            return false;
+        }
+
+        if (m_stagingTexture) {
+            m_context->CopyResource(m_stagingTexture, desktopTexture);
+
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            hr = m_context->Map(m_stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+
+            if (SUCCEEDED(hr)) {
+                int rowPitch = static_cast<int>(mapped.RowPitch);
+                int dataSize = rowPitch * m_height;
+
+                framePixels.resize(dataSize);
+
+                uint8_t* dest = framePixels.data();
+                const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+
+                for (int y = 0; y < m_height; y++) {
+                    memcpy(dest + (y * m_width * 4), src + (y * rowPitch), m_width * 4);
+                }
+
+                m_context->Unmap(m_stagingTexture, 0);
+
+                outWidth = m_width;
+                outHeight = m_height;
+
+                desktopTexture->Release();
+                m_duplication->ReleaseFrame();
+
+                return true;
+            }
+            else {
+                std::cerr << "[ScreenCapture] Failed to map staging texture: 0x"
+                    << std::hex << hr << std::dec << "\n";
+            }
+        }
+        else {
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            hr = m_context->Map(desktopTexture, 0, D3D11_MAP_READ, 0, &mapped);
+
+            if (SUCCEEDED(hr)) {
+                int rowPitch = static_cast<int>(mapped.RowPitch);
+                int dataSize = rowPitch * m_height;
+
+                framePixels.resize(dataSize);
+
+                uint8_t* dest = framePixels.data();
+                const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+
+                for (int y = 0; y < m_height; y++) {
+                    memcpy(dest + (y * m_width * 4), src + (y * rowPitch), m_width * 4);
+                }
+
+                m_context->Unmap(desktopTexture, 0);
+
+                outWidth = m_width;
+                outHeight = m_height;
+
+                desktopTexture->Release();
+                m_duplication->ReleaseFrame();
+
+                return true;
+            }
+        }
+
+        desktopTexture->Release();
+        m_duplication->ReleaseFrame();
+
         return false;
     }
 
-    IDXGIOutput* output = nullptr;
-    hr = targetAdapter->EnumOutputs(targetOutputIdx, &output);
-    targetAdapter->Release();
-    if (FAILED(hr)) { shutdown(); return false; }
+    bool ScreenCapture::checkHdrSupport(const DXGI_OUTPUT_DESC& desc) {
+        return false;
+    }
 
-    IDXGIOutput1* output1 = nullptr;
-    hr = output->QueryInterface(IID_PPV_ARGS(&output1));
-    output->Release();
-    if (FAILED(hr)) { shutdown(); return false; }
+    std::string ScreenCapture::convertWStringToString(const wchar_t* wstr) {
+        if (!wstr) return "";
 
-    hr = output1->DuplicateOutput(m_d3dDevice, &m_duplication);
-    output1->Release();
-    if (FAILED(hr)) { shutdown(); return false; }
+        int size = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
+        if (size <= 0) return "";
 
-    DXGI_OUTDUPL_DESC dupDesc;
-    m_duplication->GetDesc(&dupDesc);
-    m_width = (int)dupDesc.ModeDesc.Width;
-    m_height = (int)dupDesc.ModeDesc.Height;
-    m_format = dupDesc.ModeDesc.Format;
-    if (m_format == DXGI_FORMAT_R10G10B10A2_UNORM) m_isHdr = true;
+        std::string result(size - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &result[0], size, nullptr, nullptr);
 
-    D3D11_TEXTURE2D_DESC stagingDesc = {};
-    stagingDesc.Width = m_width;
-    stagingDesc.Height = m_height;
-    stagingDesc.MipLevels = 1;
-    stagingDesc.ArraySize = 1;
-    stagingDesc.SampleDesc.Count = 1;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.BindFlags = 0;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    stagingDesc.Format = m_format;
+        return result;
+    }
 
-    hr = m_d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &m_staging);
-    if (FAILED(hr)) { shutdown(); return false; }
+    void ScreenCapture::cleanupDeviceOnly() {
+        if (m_context) {
+            m_context->Release();
+            m_context = nullptr;
+        }
+        if (m_device) {
+            m_device->Release();
+            m_device = nullptr;
+        }
+    }
 
-    m_initialized = true;
-    return true;
-}
+    int ScreenCapture::enumerateMonitors() {
+        IDXGIFactory1* factory = nullptr;
+        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) return 0;
 
-void ScreenCapture::shutdown() {
-    m_initialized = false;
-    if (m_staging) { m_staging->Release(); m_staging = nullptr; }
-    if (m_duplication) { m_duplication->Release(); m_duplication = nullptr; }
-    if (m_d3dCtx) { m_d3dCtx->Release(); m_d3dCtx = nullptr; }
-    if (m_d3dDevice) { m_d3dDevice->Release(); m_d3dDevice = nullptr; }
-}
-
-int ScreenCapture::enumerateMonitors() {
-    if (g_monitorCount > 0) return g_monitorCount;
-
-    std::vector<WinMon> winMons;
-    EnumMonCtx ctx{ &winMons };
-    EnumDisplayMonitors(nullptr, nullptr, enumMonCB, (LPARAM)&ctx);
-
-    IDXGIFactory1* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 0;
-
-    g_monitorCount = 0;
-
-    for (auto& wm : winMons) {
-        if (g_monitorCount >= 8) break;
+        int count = 0;
         IDXGIAdapter* adapter = nullptr;
-        for (UINT ai = 0; factory->EnumAdapters(ai, &adapter) != DXGI_ERROR_NOT_FOUND; ++ai) {
-            DXGI_ADAPTER_DESC adesc;
-            adapter->GetDesc(&adesc);
 
-            IDXGIOutput* output = nullptr;
-            for (UINT oi = 0; adapter->EnumOutputs(oi, &output) != DXGI_ERROR_NOT_FOUND; ++oi) {
-                DXGI_OUTPUT_DESC od;
-                if (SUCCEEDED(output->GetDesc(&od))) {
-                    size_t winLen = wm.deviceName.length();
-                    if (wcsncmp(wm.deviceName.c_str(), od.DeviceName, winLen) == 0) {
-                        char buf[256];
-                        int cw = WideCharToMultiByte(CP_UTF8, 0, wm.deviceName.c_str(), -1, buf, 256, nullptr, nullptr);
-                        if (cw > 0) {
-                            char label[384];
-                            snprintf(label, sizeof(label), "%s (%dx%d)",
-                                     buf,
-                                     wm.rect.right - wm.rect.left,
-                                     wm.rect.bottom - wm.rect.top);
-                            g_monitorNames[g_monitorCount] = label;
-                        } else {
-                            g_monitorNames[g_monitorCount] = "Monitor " + std::to_string(g_monitorCount);
+        for (UINT i = 0; factory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+            for (UINT j = 0; ; ++j) {
+                IDXGIOutput* output = nullptr;
+                hr = adapter->EnumOutputs(j, &output);
+
+                if (hr == DXGI_ERROR_NOT_FOUND) break;
+
+                if (SUCCEEDED(hr)) {
+                    DXGI_OUTPUT_DESC desc;
+                    if (SUCCEEDED(output->GetDesc(&desc))) {
+                        if (desc.AttachedToDesktop) {
+                            count++;
                         }
-                        g_adapterLuids[g_monitorCount] = adesc.AdapterLuid;
-                        g_adapterOutputIdx[g_monitorCount] = oi;
-                        g_monitorCount++;
+                    }
+                    output->Release();
+                }
+            }
+            adapter->Release();
+
+            break;
+        }
+
+        factory->Release();
+        return count;
+    }
+
+    const char* ScreenCapture::getMonitorName(int monitorIndex) {
+        static std::string nameCache[16]; 
+        static bool initialized[16] = { false };
+
+        if (monitorIndex < 0 || monitorIndex >= 16) return nullptr;
+        if (initialized[monitorIndex]) return nameCache[monitorIndex].c_str();
+
+        IDXGIFactory1* factory = nullptr;
+        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) return nullptr;
+
+        IDXGIAdapter* adapter = nullptr;
+        if (FAILED(factory->EnumAdapters(0, &adapter))) {
+            factory->Release();
+            return nullptr;
+        }
+
+        int currentIndex = 0;
+        for (UINT i = 0; ; ++i) {
+            IDXGIOutput* output = nullptr;
+            hr = adapter->EnumOutputs(i, &output);
+
+            if (hr == DXGI_ERROR_NOT_FOUND) break;
+
+            if (SUCCEEDED(hr)) {
+                DXGI_OUTPUT_DESC desc;
+                if (SUCCEEDED(output->GetDesc(&desc)) && desc.AttachedToDesktop) {
+                    if (currentIndex == monitorIndex) {
+                        nameCache[monitorIndex] = convertWStringToString(desc.DeviceName);
+
+                        int w = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+                        int h = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+                        nameCache[monitorIndex] += " (" + std::to_string(w) + "x" + std::to_string(h) + ")";
+
+                        initialized[monitorIndex] = true;
                         output->Release();
                         adapter->Release();
-                        goto nextMon;
+                        factory->Release();
+                        return nameCache[monitorIndex].c_str();
                     }
+                    currentIndex++;
                 }
                 output->Release();
             }
-            adapter->Release();
         }
-nextMon:;
+
+        adapter->Release();
+        factory->Release();
+
+        nameCache[monitorIndex] = "Monitor " + std::to_string(monitorIndex);
+        initialized[monitorIndex] = true;
+        return nameCache[monitorIndex].c_str();
     }
 
-    factory->Release();
-    return g_monitorCount;
-}
-
-const char* ScreenCapture::getMonitorName(int idx) {
-    if (idx >= 0 && idx < g_monitorCount) return g_monitorNames[idx].c_str();
-    return nullptr;
-}
-
-int ScreenCapture::getMonitorCount() {
-    return g_monitorCount;
-}
-
-static uint16_t floatToHalf(float f) {
-    uint32_t i;
-    std::memcpy(&i, &f, sizeof(i));
-    int s = (i >> 16) & 0x8000;
-    int e = ((i >> 23) & 0xff) - 127 + 15;
-    int m = i & 0x007fffff;
-
-    if (e <= 0) {
-        if (e < -10) return (uint16_t)s;
-        m = (m | 0x00800000) >> (1 - e);
-        return (uint16_t)(s | (m >> 13));
-    } else if (e == 0xff - 127 + 15) {
-        return (uint16_t)(s | 0x7c00 | (m >> 13));
-    }
-
-    if (e > 30) return (uint16_t)(s | 0x7c00);
-    return (uint16_t)(s | (e << 10) | (m >> 13));
-}
-
-bool ScreenCapture::captureFrame(std::vector<uint8_t>& outPixels, int& outW, int& outH) {
-    if (!m_initialized) {
-        if (!m_reinitFailed) {
-            std::cerr << "[ScreenCapture] Not initialized, attempting re-init\n";
-            if (!init(m_monitorIdx)) {
-                m_reinitFailed = true;
-            }
-        }
-        return false;
-    }
-
-    outW = m_width;
-    outH = m_height;
-
-    int bpp = m_isHdr ? 8 : 4;
-    int dstStride = m_width * bpp;
-    outPixels.resize(m_height * dstStride, 0);
-
-    HRESULT hr;
-    IDXGIResource* desktopRes = nullptr;
-    DXGI_OUTDUPL_FRAME_INFO frameInfo;
-    hr = m_duplication->AcquireNextFrame(kAcquireTimeoutMs, &frameInfo, &desktopRes);
-
-    if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_DEVICE_REMOVED) {
-        std::cerr << "[ScreenCapture] Device lost, re-initializing\n";
-        shutdown();
-        m_reinitFailed = false;
-        return false;
-    }
-
-    if (SUCCEEDED(hr)) {
-        ID3D11Texture2D* gpuTex = nullptr;
-        hr = desktopRes->QueryInterface(IID_PPV_ARGS(&gpuTex));
-        desktopRes->Release();
-        if (SUCCEEDED(hr)) {
-            m_d3dCtx->CopyResource(m_staging, gpuTex);
-            gpuTex->Release();
-            m_hasData = true;
-        }
-        m_duplication->ReleaseFrame();
-    }
-
-    if (!m_hasData) return false;
-
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = m_d3dCtx->Map(m_staging, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) return false;
-
-    int srcStride = mapped.RowPitch;
-    const uint8_t* src = (const uint8_t*)mapped.pData;
-    uint8_t* dst = outPixels.data();
-
-    if (m_isHdr) {
-        for (int y = 0; y < m_height; ++y) {
-            const uint32_t* src32 = (const uint32_t*)(src + y * srcStride);
-            uint16_t* dst16 = (uint16_t*)(dst + y * dstStride);
-            for (int x = 0; x < m_width; ++x) {
-                uint32_t px = src32[x];
-                float r = ((px >> 0) & 0x3FF) / 1023.0f;
-                float g = ((px >> 10) & 0x3FF) / 1023.0f;
-                float b = ((px >> 20) & 0x3FF) / 1023.0f;
-                float a = ((px >> 30) & 0x3) / 3.0f;
-                dst16[x * 4 + 0] = floatToHalf(r);
-                dst16[x * 4 + 1] = floatToHalf(g);
-                dst16[x * 4 + 2] = floatToHalf(b);
-                dst16[x * 4 + 3] = floatToHalf(a);
-            }
-        }
-    } else {
-        int copyBytes = std::min(m_width * 4, srcStride);
-        for (int y = 0; y < m_height; ++y) {
-            std::memcpy(dst + y * dstStride, src + y * srcStride, copyBytes);
-        }
-    }
-
-    m_d3dCtx->Unmap(m_staging, 0);
-    return true;
-}
-
-}
+} // namespace OpenReplay

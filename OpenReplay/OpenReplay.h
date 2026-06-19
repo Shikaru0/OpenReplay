@@ -76,6 +76,7 @@ private:
     void onEncodedPacket(const uint8_t* data, uint32_t size, int64_t pts, bool isKey);
     void onAudioData(const uint8_t* data, uint32_t size, int64_t pts);
     void onFrameDropped();
+    int m_lastCaptureMonitor = -1;
 
     RecorderConfig m_config;
     mutable std::mutex m_configMtx;

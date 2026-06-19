@@ -163,9 +163,10 @@ bool VideoEncoder::sendFrame(AVFrame* frame, int64_t pts) {
 
     int ret = avcodec_send_frame(m_codecCtx, frame);
     if (ret < 0) {
-        char errBuf[256];
-        av_strerror(ret, errBuf, sizeof(errBuf));
-        std::cerr << "[VideoEncoder] avcodec_send_frame error: " << errBuf << "\n";
+        if (ret != AVERROR_EOF) { 
+            char errBuf[256];
+            av_strerror(ret, errBuf, sizeof(errBuf));
+        }
         return false;
     }
 
@@ -176,7 +177,7 @@ bool VideoEncoder::sendFrame(AVFrame* frame, int64_t pts) {
         if ((pkt->flags & AV_PKT_FLAG_KEY) && m_extradata.empty() &&
             m_codecCtx->extradata && m_codecCtx->extradata_size > 0) {
             m_extradata.assign(m_codecCtx->extradata,
-                               m_codecCtx->extradata + m_codecCtx->extradata_size);
+                m_codecCtx->extradata + m_codecCtx->extradata_size);
         }
         if (m_callback)
             m_callback(pkt->data, pkt->size, pkt->pts, pkt->flags & AV_PKT_FLAG_KEY);
